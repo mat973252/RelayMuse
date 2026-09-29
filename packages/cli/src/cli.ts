@@ -569,13 +569,14 @@ export async function main(argv: string[], cwd: string = process.cwd()): Promise
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
-  // nodejs/node#56645 (unfixed upstream, also undici#5680): on Windows,
+  // Compatibility mitigation for nodejs/node#56645: on Windows,
   // process.exit() can tear the event loop down while an async handle is
   // mid-close (e.g. an undici keep-alive socket), tripping libuv's
-  // UV_HANDLE_CLOSING assert in async.c. A brief drain before the forced
-  // exit lets pending closes finish — output is already flushed, this only
-  // avoids the teardown race. The same workaround shipped in TypeScript and
-  // corepack.
+  // UV_HANDLE_CLOSING assert in async.c. The upstream fix (nodejs/node#61999,
+  // merged 2026-07-24) may not be in the runtime in use — the crash was
+  // still reproduced on Node 24.13 — so a brief drain before the forced
+  // exit gives pending closes time to settle. This is a heuristic
+  // mitigation, not a guarantee that all pending I/O has completed.
   const exitAfterDrain = async (code: number): Promise<never> => {
     if (process.platform === "win32") await new Promise((r) => setTimeout(r, 100));
     return process.exit(code);

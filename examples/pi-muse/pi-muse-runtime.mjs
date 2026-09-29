@@ -45,8 +45,8 @@ const publishSpec = {
   approvalRequired: true,
   execute: async () => {
     // connection: close keeps the socket out of undici's keep-alive pool —
-    // a pooled handle mid-close during process.exit() hits the unfixed
-    // upstream Windows libuv assert (nodejs/node#56645).
+    // a pooled handle mid-close during process.exit() trips libuv's Windows
+    // UV_HANDLE_CLOSING assert (nodejs/node#56645, reproduced on Node 24.13).
     const res = await fetch(`${BASE}/publish`, {
       method: "POST",
       headers: { "content-type": "application/json", connection: "close" },

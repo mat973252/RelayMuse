@@ -61,8 +61,10 @@ function usage(): AssistantMessage["usage"] {
 
 async function getJson(url: string): Promise<Record<string, unknown>> {
   // Connection: close keeps the socket out of undici's keep-alive pool — a
-  // pooled handle mid-close during process.exit() hits the unfixed upstream
-  // Windows libuv assert (nodejs/node#56645, undici#5680).
+  // pooled handle mid-close during process.exit() trips libuv's Windows
+  // UV_HANDLE_CLOSING assert (nodejs/node#56645). Mitigation for a crash
+  // reproduced locally on Node 24.13; reduces our own trigger surface, it
+  // does not cover handles other components may create.
   const res = await fetch(url, { headers: { connection: "close" } });
   if (!res.ok) throw new Error(`job server HTTP ${String(res.status)} for ${url}`);
   return (await res.json()) as Record<string, unknown>;
