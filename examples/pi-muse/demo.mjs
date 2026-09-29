@@ -185,6 +185,19 @@ async function orchestrate() {
     check("task 2 created + parked", task2 !== undefined && run2.out.includes("status WAITING"));
     await relay(["task", "approve", task2], { cwd: ws });
 
+    // Crash evidence = real death + kill-intent marker at the crash point +
+    // no after-kill marker + remote committed. A plain non-zero exit cannot
+    // satisfy it. The negative leg runs BEFORE the crash leg so no kill
+    // marker exists yet (required on win32 where wasKilled is ambiguous).
+    const KILL_INTENT = join(ws, ".relay", "kill-intent");
+    const AFTER_KILL = join(ws, ".relay", "after-kill");
+    const killedEvidence = (res, committed) =>
+      wasKilled(res) && existsSync(KILL_INTENT) && !existsSync(AFTER_KILL) && committed;
+    const notKilled = await relay(["task", "resume", "00000000-0000-0000-0000-000000000000"], { cwd: ws, env: env2 });
+    check("a plain non-zero exit is not crash evidence",
+      notKilled.status !== 0 && !killedEvidence(notKilled, true),
+      `status=${notKilled.status} signal=${notKilled.signal}`);
+
     const killed = await relay(["task", "resume", task2, "--adapter-module", RUNTIME], {
       cwd: ws,
       env: { ...env2, MUSE_CRASH_AFTER_PUBLISH: "1" },
@@ -194,22 +207,8 @@ async function orchestrate() {
     check("remote committed the publish for pkg-2", state.publishedKeys.includes("release-pkg-2"));
     check("publish REQUESTS == 2 total (one per task)", state.publishRequests === 2);
 
-    // Combined crash evidence: real death + kill-intent marker written at the
-    // expected crash point + no after-kill marker + remote committed. A
-    // plain non-zero exit cannot satisfy this predicate.
-    const KILL_INTENT = join(ws, ".relay", "kill-intent");
-    const AFTER_KILL = join(ws, ".relay", "after-kill");
-    const killedEvidence = (res, committed) =>
-      wasKilled(res) && existsSync(KILL_INTENT) && !existsSync(AFTER_KILL) && committed;
     check("crash evidence: killed at the commit point (intent marker, no after-kill, remote committed)",
       killedEvidence(killed, state.publishedKeys.includes("release-pkg-2")));
-    // Negative leg: a plain non-zero exit (unknown task -> exit 66, no kill
-    // markers) must NOT count as crash evidence even where wasKilled is
-    // platform-ambiguous (win32 signal=null + non-zero).
-    const notKilled = await relay(["task", "resume", "00000000-0000-0000-0000-000000000000"], { cwd: ws, env: env2 });
-    check("a plain non-zero exit is not crash evidence",
-      notKilled.status !== 0 && !killedEvidence(notKilled, true),
-      `status=${notKilled.status} signal=${notKilled.signal}`);
 
     const snapCrash = await show(ws, task2);
     check("journal still holds the unsettled effect", (snapCrash.unresolvedEffects ?? []).length >= 1);
