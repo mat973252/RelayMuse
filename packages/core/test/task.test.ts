@@ -853,3 +853,96 @@ describe("completion gate (stage 1)", () => {
     assert.equal((await journal.getByKey(`task/${task.id}/publish`))?.status, "CONFIRMED");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task run lease — single-writer concurrency (stage 2)
+// ---------------------------------------------------------------------------
+
+async function deadPid(): Promise<number> {
+  // A real, verifiably dead process id — spawn one and let it exit.
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, ["-e", "0"]);
+  await new Promise((resolve) => child.once("close", resolve));
+  assert.ok(child.pid !== undefined);
+  return child.pid;
+}
+
+describe("task run lease — single writer (stage 2)", () => {
+  it("a second resume while the lease is held reports busy and never reaches the adapter", async () => {
+    const { runtime, store } = rig();
+    const calls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+
+    const claim = await store.claimRunLease(task.id, { id: "other-owner", pid: process.pid }, Date.now());
+    assert.equal(claim.status, "acquired");
+
+    const outcome = await runtime.resume(task.id, { adapter: countingAdapter(calls) });
+    assert.equal(outcome.outcome, "busy");
+    if (outcome.outcome === "busy") assert.equal(outcome.owner.ownerPid, process.pid);
+    assert.equal(calls.resume, 0, "the losing resume must not touch the adapter");
+    const after = await store.getTask(task.id);
+    assert.equal(after?.status, "ACTIVE", "busy resume must not mutate task state");
+  });
+
+  it("a live owner is never stolen: busy stays busy until release", async () => {
+    const { runtime, store } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    await store.claimRunLease(task.id, { id: "other-owner", pid: process.pid }, Date.now());
+
+    const outcome = await runtime.resume(task.id, { adapter: countingAdapter({ resume: 0 }) });
+    assert.equal(outcome.outcome, "busy");
+    const lease = await store.runLease(task.id);
+    assert.equal(lease?.ownerId, "other-owner", "no steal of a live owner's lease");
+
+    await store.releaseRunLease(task.id, "other-owner");
+    assert.equal(await store.runLease(task.id), undefined);
+  });
+
+  it("a lease left by a dead owner is reclaimed; the work then completes once", async () => {
+    const { runtime, store } = rig();
+    const calls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+
+    // Simulate a crashed runner: the lease row outlives its dead owner.
+    const dead = await deadPid();
+    const stale = await store.claimRunLease(task.id, { id: "dead-owner", pid: dead }, Date.now());
+    assert.equal(stale.status, "acquired");
+
+    let continued = 0;
+    const outcome = await runtime.resume(task.id, {
+      adapter: countingAdapter(calls),
+      continuation: async () => {
+        continued += 1;
+      },
+    });
+    assert.equal(outcome.outcome, "resumed");
+    assert.equal(calls.resume, 1);
+    assert.equal(continued, 1);
+    // The winner released the lease when it finished.
+    assert.equal(await store.runLease(task.id), undefined);
+  });
+
+  it("release is owner-guarded: a non-owner cannot free another's lease", async () => {
+    const { runtime, store } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    await store.claimRunLease(task.id, { id: "owner-a", pid: process.pid }, Date.now());
+    await store.releaseRunLease(task.id, "owner-b");
+    const lease = await store.runLease(task.id);
+    assert.equal(lease?.ownerId, "owner-a", "the real owner still holds the lease");
+  });
+
+  it("the lease covers the whole resume: it is held while the continuation runs", async () => {
+    const { runtime, store } = rig();
+    const calls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    let leaseDuringContinuation: string | undefined;
+    await runtime.resume(task.id, {
+      adapter: countingAdapter(calls),
+      continuation: async () => {
+        leaseDuringContinuation = (await store.runLease(task.id))?.ownerId;
+      },
+    });
+    assert.ok(leaseDuringContinuation !== undefined, "continuation ran under the lease");
+    assert.equal(await store.runLease(task.id), undefined, "released at the end of resume");
+  });
+});

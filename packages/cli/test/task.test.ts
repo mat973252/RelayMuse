@@ -451,11 +451,15 @@ export async function continuation({ runtime, task }) {
       const show = await runCliAsync(["task", "show", id], env, ws);
       const snap = JSON.parse(show.out) as {
         status: string;
-        artifacts: unknown[];
+        artifacts: { role: string }[];
         investigation?: { decisions: unknown[] };
       };
       assert.notEqual(snap.status, "COMPLETED", "a failed publish must never complete the task");
-      assert.equal(snap.artifacts.length, 1, "no success receipt artifact was written");
+      assert.equal(
+        snap.artifacts.filter((a) => a.role === "generated").length,
+        0,
+        "no success receipt artifact was written",
+      );
       assert.equal(snap.investigation?.decisions.length ?? 0, 0, "no success decision was recorded");
 
       const state = await server.state();
@@ -719,3 +723,193 @@ export async function continuation({ runtime, task }) {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Stage 2: task run lease — concurrent resume on one task is single-writer.
+// Verified with real child processes sharing one storage.db, plus a real
+// SIGKILLed owner being reclaimed (not stolen by timeout while alive).
+// ---------------------------------------------------------------------------
+
+describe("relay task run lease (cross-process, stage 2)", () => {
+  function writeLockModule(): string {
+    return writeModule(`
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.env.MARK_DIR;
+const count = (n) => { const f = join(dir, n + ".count"); return existsSync(f) ? readFileSync(f, "utf8").length : 0; };
+const bump = (n) => { appendFileSync(join(dir, n + ".count"), "x"); return count(n); };
+const spec = {
+  name: "publish",
+  kind: "http/publish",
+  request: { key: "lock-1" },
+  approvalRequired: false,
+  execute: async () => {
+    const res = await fetch(process.env.MUSE_SERVER_URL + "/publish", {
+      method: "POST",
+      headers: { "content-type": "application/json", connection: "close" },
+      body: JSON.stringify({ key: "lock-1" }),
+    });
+    if (!res.ok) throw new Error("publish failed " + res.status);
+    return res.json();
+  },
+};
+export const effects = [spec];
+export const adapter = {
+  id: "pi",
+  resume: async () => {
+    bump("adapter-calls");
+    if (process.env.LEASE_CRASH === "1") {
+      // Owner dies mid-resume while holding the run lease.
+      process.kill(process.pid, "SIGKILL");
+    }
+    // Hold the lease long enough for a contending resume to lose.
+    await new Promise((r) => setTimeout(r, 2500));
+    return { resumed: true, status: "completed" };
+  },
+};
+export async function run() {}
+export async function continuation({ runtime, task }) {
+  bump("continued");
+  await runtime.runTaskEffect(task.id, spec);
+  await runtime.complete(task.id);
+}
+`);
+  }
+
+  it("two resume children racing on one task: exactly one continuation, loser exits busy", { timeout: 300_000 }, async () => {
+    const { startReleaseServer } = (await import(
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
+    )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
+    const server = await startReleaseServer(50);
+    const mark = join(tmp, "mark-lease-race");
+    mkdirSync(mark, { recursive: true });
+    const ws = mkdtempSync(join(tmp, "lease-ws-"));
+    const modPath = writeLockModule();
+    const env = { MARK_DIR: mark, MUSE_SERVER_URL: server.baseUrl };
+    try {
+      const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env, ws);
+      assert.equal(run.status, 0, run.stderr);
+      const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+      const a = runCliAsync(["task", "resume", id, "--adapter-module", modPath], env, ws);
+      // Let A win the lease and enter the adapter's long resume.
+      await new Promise((r) => setTimeout(r, 700));
+
+      // Read-only inspection stays usable while the lease is held.
+      const shown = runCliEnv(["task", "show", id], env, ws);
+      assert.equal(shown.status, 0, shown.stderr);
+
+      const b = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env, ws);
+      assert.equal(b.status, 2, `the loser must exit non-success: ${b.stdout} ${b.stderr}`);
+      assert.match(b.stdout ?? "", /busy/);
+
+      const aResult = await a;
+      assert.equal(aResult.status, 0, aResult.err || aResult.out);
+      assert.equal(markerCount(mark, "continued"), 1, "exactly one continuation ran");
+      assert.equal(markerCount(mark, "adapter-calls"), 1, "the loser never reached the adapter");
+      const state = await server.state();
+      assert.equal(state.publishRequests, 1);
+      assert.equal(state.mutations, 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("a SIGKILLed owner is reclaimed — a later resume completes once, POST=1", { timeout: 300_000 }, async () => {
+    const { startReleaseServer } = (await import(
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
+    )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
+    const server = await startReleaseServer(50);
+    const mark = join(tmp, "mark-lease-crash");
+    mkdirSync(mark, { recursive: true });
+    const ws = mkdtempSync(join(tmp, "lease-ws2-"));
+    const modPath = writeLockModule();
+    const env = { MARK_DIR: mark, MUSE_SERVER_URL: server.baseUrl };
+    try {
+      const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env, ws);
+      const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+      const crashed = await runCliAsync(
+        ["task", "resume", id, "--adapter-module", modPath],
+        { ...env, LEASE_CRASH: "1" },
+        ws,
+      );
+      const died =
+        crashed.signal === "SIGKILL" ||
+        (process.platform === "win32" && crashed.signal === null && crashed.status !== 0);
+      assert.ok(died, `expected the resume to die holding the lease: ${crashed.out} ${crashed.err}`);
+
+      const recovered = await runCliAsync(["task", "resume", id, "--adapter-module", modPath], env, ws);
+      assert.equal(recovered.status, 0, recovered.err || recovered.out);
+      assert.match(recovered.out, /resumed/);
+      assert.equal(markerCount(mark, "continued"), 1, "exactly one continuation after reclaim");
+      const state = await server.state();
+      assert.equal(state.publishRequests, 1, "the effect ran once — no duplicate POST");
+      assert.equal(state.mutations, 1);
+      const shown = JSON.parse(runCliEnv(["task", "show", id], env, ws).stdout ?? "{}") as { status: string };
+      assert.equal(shown.status, "COMPLETED");
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stage 2: release readiness derives from a REAL synthetic-package test run.
+// The controllable failure leg (MUSE_PKG_FAIL=1) must block the releasable
+// belief, the publish decision, and the success receipt — end to end.
+// ---------------------------------------------------------------------------
+
+describe("pi-muse release readiness (stage 2)", () => {
+  it("a failing package test blocks readiness: no approval gate, no publish, resume refused", { timeout: 300_000 }, async () => {
+    const { startReleaseServer } = (await import(
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
+    )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
+    const runtimePath = fileURLToPath(new URL("../../../../examples/pi-muse/pi-muse-runtime.mjs", import.meta.url));
+    const server = await startReleaseServer(50);
+    const ws = mkdtempSync(join(tmp, "pkg-fail-ws-"));
+    const env = {
+      MUSE_SERVER_URL: server.baseUrl,
+      MUSE_SESSION_DIR: join(ws, ".relay", "sessions"),
+      MUSE_PKG_FAIL: "1",
+    };
+    try {
+      const run = await runCliAsync(["task", "run", "release bad-pkg", "--adapter-module", runtimePath], env, ws);
+      assert.equal(run.status, 2, `test failure must surface as BLOCKED: ${run.out} ${run.err}`);
+      assert.match(run.out, /blocked \(package tests failed/);
+      assert.doesNotMatch(run.out, /awaiting-approval/, "no approval gate for a package that failed tests");
+      const id = /task ([0-9a-f-]{36})/.exec(run.out)?.[1] ?? "";
+
+      const shown = await runCliAsync(["task", "show", id], env, ws);
+      const snap = JSON.parse(shown.out) as {
+        status: string;
+        investigation?: { claims: { belief: string }[] };
+      };
+      assert.equal(snap.status, "BLOCKED");
+      assert.equal(
+        snap.investigation?.claims[0]?.belief,
+        "rejected",
+        "the releasable belief is rejected by the real failing exit code",
+      );
+
+      // Resume after restart still refuses: BLOCKED -> adapter leg clears,
+      // then the rejected belief refuses the publish — no receipt, no decision.
+      let refused = "";
+      for (let n = 0; n < 4; n++) {
+        const r = await runCliAsync(["task", "resume", id, "--adapter-module", runtimePath], env, ws);
+        refused += r.out;
+        if (r.out.includes("publish refused")) break;
+      }
+      assert.match(refused, /publish refused/);
+      const state = await server.state();
+      assert.equal(state.publishRequests, 0, "the failed package was never published");
+      assert.equal(state.mutations, 0);
+      const after = await runCliAsync(["task", "show", id], env, ws);
+      const snapAfter = JSON.parse(after.out) as { status: string; artifacts: { role: string }[] };
+      assert.equal(snapAfter.status, "BLOCKED");
+      assert.equal(snapAfter.artifacts.filter((a) => a.role === "generated").length, 0, "no success receipt");
+    } finally {
+      await server.stop();
+    }
+  });
+});

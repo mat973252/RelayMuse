@@ -23,6 +23,8 @@ import type {
   TaskEvent,
   TaskEventInput,
   TaskEventType,
+  TaskRunLease,
+  TaskRunLeaseClaim,
   TaskStatus,
   TaskStore,
 } from "@relay/core";
@@ -79,6 +81,13 @@ CREATE TABLE IF NOT EXISTS relay_task_artifacts (
   PRIMARY KEY (task_id, artifact_id)
 );
 CREATE INDEX IF NOT EXISTS relay_task_artifacts_task ON relay_task_artifacts(task_id);
+-- Single-writer run lease: one row per task while a resume executes.
+CREATE TABLE IF NOT EXISTS relay_task_run_leases (
+  task_id     TEXT PRIMARY KEY REFERENCES relay_tasks(id),
+  owner_id    TEXT NOT NULL,
+  owner_pid   INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL
+);
 `;
 
 interface TaskRow {
@@ -457,5 +466,54 @@ export class SqliteTaskStore implements TaskStore {
       ref: row.ref ?? undefined,
       at: row.at,
     }));
+  }
+
+  async claimRunLease(
+    taskId: string,
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerPid?: number,
+  ): Promise<TaskRunLeaseClaim> {
+    let result: TaskRunLeaseClaim | undefined;
+    this.transaction(() => {
+      const row = this.db
+        .prepare("SELECT * FROM relay_task_run_leases WHERE task_id = ?")
+        .get(taskId) as { task_id: string; owner_id: string; owner_pid: number; acquired_at: number } | undefined;
+      const free = row === undefined;
+      // Stale-owner reclaim: only while the recorded pid still matches the
+      // one the caller proved dead — a live owner is never overwritten.
+      const reclaim = !free && expectedOwnerPid !== undefined && row.owner_pid === expectedOwnerPid;
+      if (free || reclaim) {
+        this.db
+          .prepare(
+            `INSERT INTO relay_task_run_leases (task_id, owner_id, owner_pid, acquired_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET owner_id = excluded.owner_id,
+               owner_pid = excluded.owner_pid, acquired_at = excluded.acquired_at`,
+          )
+          .run(taskId, owner.id, owner.pid, at);
+        result = { status: "acquired" };
+        return;
+      }
+      result = {
+        status: "busy",
+        owner: { taskId, ownerId: row.owner_id, ownerPid: row.owner_pid, acquiredAt: row.acquired_at },
+      };
+    });
+    return result as TaskRunLeaseClaim;
+  }
+
+  async releaseRunLease(taskId: string, ownerId: string): Promise<void> {
+    // Owner-guarded: a non-owner can never delete another's lease.
+    this.db.prepare("DELETE FROM relay_task_run_leases WHERE task_id = ? AND owner_id = ?").run(taskId, ownerId);
+  }
+
+  async runLease(taskId: string): Promise<TaskRunLease | undefined> {
+    const row = this.db
+      .prepare("SELECT * FROM relay_task_run_leases WHERE task_id = ?")
+      .get(taskId) as { task_id: string; owner_id: string; owner_pid: number; acquired_at: number } | undefined;
+    return row === undefined
+      ? undefined
+      : { taskId, ownerId: row.owner_id, ownerPid: row.owner_pid, acquiredAt: row.acquired_at };
   }
 }

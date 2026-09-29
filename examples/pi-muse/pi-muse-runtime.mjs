@@ -11,7 +11,10 @@
  *   MUSE_CRASH_AFTER_PUBLISH=1 SIGKILL inside execute() AFTER the remote
  *                              commit — exercises the UNKNOWN/reconcile path.
  */
-import { join } from "node:path";
+import { join, relative } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 const ADAPTER = new URL("../../packages/adapter-pi/dist/src/index.js", import.meta.url).href;
 const ARTIFACT = new URL("../../packages/artifact-fs/dist/src/index.js", import.meta.url).href;
@@ -28,6 +31,71 @@ const SESSION_DIR = process.env.MUSE_SESSION_DIR ?? join(CWD, ".relay", "session
 const ARTIFACTS = join(CWD, ".relay", "artifacts");
 const DB = join(CWD, ".relay", "storage.db");
 const RELEASE_KEY = process.env.MUSE_RELEASE_KEY ?? "release-pkg-1";
+const PKG_DIR = join(CWD, ".relay", "pkg");
+
+function sha256(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/**
+ * Minimal synthetic package the readiness check exercises. Local files only —
+ * clearly a test fixture, never a real model or remote service. The test
+ * exits 1 when MUSE_PKG_FAIL=1 (the controllable failure leg).
+ */
+function ensureSyntheticPackage() {
+  mkdirSync(PKG_DIR, { recursive: true });
+  writeFileSync(
+    join(PKG_DIR, "package.json"),
+    `${JSON.stringify({ name: "pi-muse-synthetic-pkg", version: "0.0.0", private: true }, null, 2)}\n`,
+  );
+  writeFileSync(
+    join(PKG_DIR, "test.mjs"),
+    `// Synthetic package check — a real child process; MUSE_PKG_FAIL=1 forces exit 1.\nif (process.env.MUSE_PKG_FAIL === "1") {\n  process.stderr.write("FAIL: synthetic package check failed\\n");\n  process.exit(1);\n}\nprocess.stdout.write("PASS: synthetic package check\\n");\n`,
+  );
+}
+
+/** Manifest of the synthetic package (content digests — the lineage root). */
+function packageManifest() {
+  const lines = ["synthetic package manifest"];
+  for (const name of readdirSync(PKG_DIR).sort()) {
+    const content = readFileSync(join(PKG_DIR, name));
+    lines.push(`file ${name} sha256=${sha256(content)} bytes=${content.byteLength}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Run the synthetic package's real test command and return the evidence.
+ * The result comes from an actual child exit code — never a canned string.
+ */
+function runPackageCheck() {
+  ensureSyntheticPackage();
+  const startedAt = Date.now();
+  const res = spawnSync(process.execPath, ["test.mjs"], {
+    cwd: PKG_DIR,
+    env: process.env,
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  const finishedAt = Date.now();
+  const exitCode = res.status ?? -1;
+  const rel = relative(CWD, PKG_DIR);
+  return {
+    pass: res.status === 0,
+    content:
+      `release readiness check\n` +
+      `command=${process.execPath} ${rel}/test.mjs\n` +
+      `cwd=${rel}\n` +
+      `exitCode=${exitCode}\n` +
+      `result=${exitCode === 0 ? "pass" : "fail"}\n` +
+      `startedAt=${startedAt}\n` +
+      `finishedAt=${finishedAt}\n` +
+      `stdoutSha256=${sha256(res.stdout ?? "")}\n` +
+      `stderrSha256=${sha256(res.stderr ?? "")}\n` +
+      `stdout=${(res.stdout ?? "").trim()}\n` +
+      `stderr=${(res.stderr ?? "").trim()}\n`,
+  };
+}
 
 export const adapter = new PiTaskAdapter({
   model: mockDeferredModel(),
@@ -79,19 +147,33 @@ async function openEpi() {
   return SqliteEpistemicStore.open({ path: DB });
 }
 
-/** First leg of `task run`: check the package, persist evidence, gate publish. */
+/** First leg of `task run`: really test the package, persist evidence, gate publish. */
 export async function run({ runtime, task }) {
-  // 1. "Check package" — evidence lands as a content-addressed artifact.
+  // 1. Package manifest -> lineage root artifact.
   const store = await ArtifactStore.open({ root: ARTIFACTS });
-  const report = await store.write({
-    content: `release check for "${task.goal}"\nkey=${RELEASE_KEY}\nresult=pass\n`,
+  ensureSyntheticPackage();
+  const pkgRecord = await store.write({
+    content: packageManifest(),
     mediaType: "text/plain",
     producer: { type: "tool", id: "release-check" },
     refs: { run: task.id },
   });
+  await runtime.linkArtifact(task.id, pkgRecord.artifactId, "input");
+
+  // 2. Real test run — child exit code + command + output digests + timing
+  //    land as evidence, as a CHILD of the package manifest record.
+  const check = runPackageCheck();
+  const report = await store.write({
+    content: check.content,
+    mediaType: "text/plain",
+    producer: { type: "tool", id: "release-check" },
+    parents: [pkgRecord.id],
+    refs: { run: task.id },
+  });
   await runtime.linkArtifact(task.id, report.artifactId, "evidence");
 
-  // 2. Epistemic spine: an investigation, one claim, the evidence attached.
+  // 3. Epistemic spine: the releasable belief is derived from the REAL exit
+  //    code — a failing test yields a rejected belief, never an accepted one.
   const epi = await openEpi();
   const investigationId = `inv-${task.id}`;
   await epi.createInvestigation({
@@ -114,21 +196,29 @@ export async function run({ runtime, task }) {
     id: `ev-${task.id}`,
     claimId: `claim-${task.id}`,
     ref: { kind: "artifact", ref: report.artifactId },
-    supports: true,
+    supports: check.pass,
     observedAt: Date.now(),
   });
   await epi.putBelief({
     id: `belief-${task.id}`,
     claimId: `claim-${task.id}`,
     scope: `task:${task.id}`,
-    confidence: 0.9,
-    status: "accepted",
+    confidence: check.pass ? 0.9 : 0.1,
+    status: check.pass ? "accepted" : "rejected",
     basedOn: [`ev-${task.id}`],
     updatedAt: Date.now(),
   });
   epi.close();
 
-  // 3. The gated mutation: ASK -> APPROVAL await -> task parks WAITING.
+  // 4. A failed package test blocks the publish before any approval wait —
+  //    the task is parked BLOCKED with the failure as the reason.
+  if (!check.pass) {
+    await runtime.blockTask(task.id, "package-tests-failed");
+    process.stdout.write(`publish decision: blocked (package tests failed: exit non-zero)\n`);
+    return;
+  }
+
+  // 5. The gated mutation: ASK -> APPROVAL await -> task parks WAITING.
   const outcome = await runtime.runTaskEffect(task.id, publishSpec);
   process.stdout.write(`publish decision: ${outcome.decision}\n`);
 }
@@ -140,6 +230,17 @@ export async function run({ runtime, task }) {
  * task. UNKNOWN is reconciled by the resume gate (read-only, never re-POST).
  */
 export async function continuation({ runtime, task }) {
+  // Re-verify the readiness belief — a rejected/missing belief refuses the
+  // publish decision and the success receipt, then parks the task BLOCKED.
+  const epi = await openEpi();
+  const belief = await epi.beliefFor(`claim-${task.id}`);
+  epi.close();
+  if (belief?.status !== "accepted") {
+    await runtime.blockTask(task.id, "release-readiness-not-accepted");
+    process.stdout.write(`publish refused: release readiness not established (belief=${belief?.status ?? "none"})\n`);
+    return;
+  }
+
   const outcome = await runtime.runTaskEffect(task.id, publishSpec);
   process.stdout.write(`publish decision after resume: ${outcome.decision}\n`);
 
@@ -151,16 +252,26 @@ export async function continuation({ runtime, task }) {
   }
 
   const store = await ArtifactStore.open({ root: ARTIFACTS });
+  // The receipt's lineage parent is the test-evidence artifact — the chain
+  // package -> test evidence -> publish receipt is verifiable, not asserted.
+  const links = await runtime.taskArtifacts(task.id);
+  const parents = [];
+  for (const link of links) {
+    if (link.role !== "evidence") continue;
+    const record = await store.resolve(link.artifactId);
+    if (record !== undefined) parents.push(record.id);
+  }
   const receipt = await store.write({
     content: `release receipt\nkey=${RELEASE_KEY}\neffect=${outcome.effectId}\n`,
     mediaType: "text/plain",
     producer: { type: "tool", id: "release-publish" },
+    parents,
     refs: { run: task.id },
   });
   await runtime.linkArtifact(task.id, receipt.artifactId, "generated");
 
-  const epi = await openEpi();
-  await epi.putDecision({
+  const epi2 = await openEpi();
+  await epi2.putDecision({
     id: `decision-${task.id}`,
     investigationId: `inv-${task.id}`,
     summary: `release ${RELEASE_KEY} approved and published`,
@@ -168,6 +279,6 @@ export async function continuation({ runtime, task }) {
     createdAt: Date.now(),
     resolvedAt: Date.now(),
   });
-  epi.close();
+  epi2.close();
   await runtime.complete(task.id);
 }

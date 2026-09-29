@@ -231,6 +231,11 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
           case "blocked":
             process.stdout.write(`blocked ${id}  reason=${outcome.reason}\n`);
             return outcome.reason === "await-pending" ? 1 : 2;
+          case "busy":
+            // Another live process owns this task's run lease — a distinct
+            // non-success outcome, never a second run.
+            process.stdout.write(`busy ${id}  owner-pid=${String(outcome.owner.ownerPid)}\n`);
+            return 2;
           case "cancelled":
             process.stdout.write(`cancelled ${id}\n`);
             return 2;

@@ -29,4 +29,5 @@ jobs:
         run: echo "$GITHUB_WORKSPACE/packages/adapter-pi/node_modules/.bin" >> "$GITHUB_PATH"
       - run: pnpm check
       - run: node examples/crash-demo.mjs
+      - run: node examples/pi-muse/demo.mjs
       - run: node scripts/verify-hosts.mjs
