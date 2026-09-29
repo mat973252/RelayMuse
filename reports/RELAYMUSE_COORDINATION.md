@@ -1,6 +1,6 @@
 # RelayMuse 协调状态
 
-最后核验：2026-09-29 11:35 Asia/Shanghai。
+最后核验：2026-09-29 23:09 Asia/Shanghai。
 
 - 用户授权：Devin Cloud 实现；Codex 管进度和独立验收；建立开源 GitHub 项目。
 - GitHub：https://github.com/mat973252/RelayMuse；PUBLIC / MIT。
@@ -22,6 +22,10 @@
 ## 下一步
 
 ### 最新独立复核（覆盖上方历史状态）
+
+- **23:09 阶段三前置核验通过，待费用刷新后派发**：用户“继续吧”授权继续既定第三阶段。真实 Pi 公共 ModelRuntime API 经本机已有配置调用 aisix/deepseek-v4-flash，stopReason=stop，指定合成输出匹配，99 tokens，exit0；尚未通过 Relay AgentSession/任务恢复/effect 的端到端验收。SDK 配置 cost=0 不证明免费。凭据未输出、未保存、未传 Devin。
+- 原 Devin session API 当前 suspended；浏览器 inventory/createTab 均报 nodeRepl.fetch request failed，无法刷新实际费用，因此未发新计费消息、未增加预算。最后已核验总9.70美元/本轮新增7.13/余额2.87仅为11:35历史值。阶段三具体范围与验收写入 tasks/RELAYMUSE_STAGE3_REAL_PI.md；恢复监督后先查费用，再降消息窗口到当前余额以内整数金额并沿用原session派发。
+- 阶段三确认缺口：adapter 无deferred不等于同步模型成功；需公共 session getters、持久最终assistant结果校验、失败不 continuation、重开不重复模型请求，真实模型与本地fixture分开取证。阶段一/二PASS保持。
 
 - **11:35 最终状态：阶段1/2均独立通过并合并，监督自动化将暂停。** PR#2 accepted head64a6b295db10c1f872b841b8f6a8a64c1f771c6e，merge39919bfc803f7aef57721f6902c2805f0e2f806e，合并03:34:37Z；本机main已快进同步。独立Windows Node24.13.0/pnpm10.33 check exit0（277 tests，275 pass，2符号链接权限skip，0fail），默认demo exit0/41检查、两任务POST=2；旧竞态复现现在continued=1，B=completed/already。新精确head已读diff，fresh终态/CANCELLED两child窗口、kill复合证据及readiness失败artifact内容验收通过，CI矩阵四绿。
 - 独立报告reports/RELAYMUSE_CODEX_ACCEPTANCE_2026-09-29.md；本机原始日志stage2-rework-check.log、stage2-rework-demo.log、stage2-stale-fixed.log保存在审查目录。最后费用网页总9.70美元，历史2.57，本轮新增7.13/10，余2.87；3美元窗口保持，未发新任务消息/未增加预算。API ACU不用于判断费用。
