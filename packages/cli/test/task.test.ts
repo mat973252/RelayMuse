@@ -287,7 +287,11 @@ export async function run({ runtime, task }) {
 `);
     const ws = mkdtempSync(join(tmp, "kill-ws-"));
     const child = await runCliAsync(["task", "run", "ship", "--adapter-module", modPath], {}, ws);
-    assert.equal(child.signal, "SIGKILL", `expected the run process to die: ${child.out}`);
+    // POSIX reports signal SIGKILL; Windows reports signal null with a non-zero exit.
+    const died =
+      child.signal === "SIGKILL" ||
+      (process.platform === "win32" && child.signal === null && child.status !== 0);
+    assert.ok(died, `expected the run process to die: ${child.out}`);
     const taskId = /task ([0-9a-f-]{36})/.exec(child.out)?.[1] ?? "";
     const snap = JSON.parse(runCliEnv(["task", "show", taskId], {}, ws).stdout ?? "{}") as {
       status: string;
@@ -421,7 +425,7 @@ export async function continuation({ runtime, task }) {
 
   it("pi-muse module: a FAILED publish writes no success receipt and never completes", { timeout: 300_000 }, async () => {
     const { startReleaseServer } = (await import(
-      fileURLToPath(new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url))
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
     )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
     const runtimePath = fileURLToPath(new URL("../../../../examples/pi-muse/pi-muse-runtime.mjs", import.meta.url));
     const server = await startReleaseServer(50);
