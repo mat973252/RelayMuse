@@ -60,7 +60,12 @@ function usage(): AssistantMessage["usage"] {
 }
 
 async function getJson(url: string): Promise<Record<string, unknown>> {
-  const res = await fetch(url);
+  // Connection: close keeps the socket out of undici's keep-alive pool — a
+  // pooled handle mid-close during process.exit() trips libuv's Windows
+  // UV_HANDLE_CLOSING assert (nodejs/node#56645). Mitigation for a crash
+  // reproduced locally on Node 24.13; reduces our own trigger surface, it
+  // does not cover handles other components may create.
+  const res = await fetch(url, { headers: { connection: "close" } });
   if (!res.ok) throw new Error(`job server HTTP ${String(res.status)} for ${url}`);
   return (await res.json()) as Record<string, unknown>;
 }
@@ -75,7 +80,10 @@ export function createMockDeferredProvider(options: MockDeferredProviderOptions)
   const providerId = options.providerId ?? MOCK_PROVIDER_ID;
   const model = mockDeferredModel(providerId);
   const submit = async (): Promise<string> => {
-    const res = await fetch(new URL("/js", options.baseUrl), { method: "POST" });
+    const res = await fetch(new URL("/js", options.baseUrl), {
+      method: "POST",
+      headers: { connection: "close" },
+    });
     if (!res.ok) throw new Error(`job server submit failed: ${String(res.status)}`);
     const body = (await res.json()) as { jobId: string };
     return body.jobId;

@@ -11,7 +11,7 @@
  * Relay never reimplements the agent loop or DeferredHandle semantics; this
  * adapter only carries references and delegates every continuation to Pi.
  */
-import type { AgentAdapter, AgentRef, AgentState } from "@relay/core";
+import type { AgentAdapter, AgentRef, AgentResumeResult, AgentState } from "@relay/core";
 import type { Api, DeferredHandle, Model, Provider } from "@earendil-works/pi-ai";
 import { existsSync } from "node:fs";
 import { readdir } from "node:fs/promises";
@@ -105,9 +105,9 @@ export class PiTaskAdapter implements AgentAdapter {
    * session file first — a crash between attach and ref persistence still
    * recovers.
    */
-  async resume(ref: AgentRef): Promise<{ resumed: boolean; detail?: string | undefined; output?: unknown }> {
+  async resume(ref: AgentRef): Promise<AgentResumeResult> {
     if (ref.sessionFile === undefined) {
-      return { resumed: false, detail: "no session file reference" };
+      return { resumed: false, status: "idle", detail: "no session file reference" };
     }
     let handle: DeferredHandle | undefined = ref.deferredRef;
     if (handle === undefined) {
@@ -115,7 +115,9 @@ export class PiTaskAdapter implements AgentAdapter {
       handle = discovered.find((found) => found.sessionFile === ref.sessionFile)?.handle;
     }
     if (handle === undefined) {
-      return { resumed: false, detail: "no deferred run to continue" };
+      // Nothing persisted to continue: a legitimate no-deferred idle, not a
+      // failure and not still-running work.
+      return { resumed: false, status: "idle", detail: "no deferred run to continue" };
     }
 
     const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
@@ -133,10 +135,14 @@ export class PiTaskAdapter implements AgentAdapter {
       });
       if (result.stopReason === "stop") {
         const text = result.content?.map((part) => (part.type === "text" ? part.text : "")).join("") ?? "";
-        return { resumed: true, detail: "deferred run completed", output: text };
+        return { resumed: true, status: "completed", detail: "deferred run completed", output: text };
       }
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
-    return { resumed: false, detail: `deferred run still pending after ${String(maxPolls)} polls` };
+    return {
+      resumed: false,
+      status: "pending",
+      detail: `deferred run still pending after ${String(maxPolls)} polls`,
+    };
   }
 }

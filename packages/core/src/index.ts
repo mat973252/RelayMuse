@@ -62,10 +62,13 @@ export {
   type MigrationEvidence,
 } from "./capsule.js";
 export {
+  adapterWaitRef,
   MemoryTaskStore,
   TASK_TERMINAL_STATUSES,
+  TaskAwaitPendingError,
   TaskNotActiveError,
   TaskRuntime,
+  TaskUnsettledEffectsError,
   taskEffectKey,
   taskEffectPrefix,
   type AgentAdapter,
@@ -74,6 +77,7 @@ export {
   type AgentResumeContext,
   type AgentResumeResult,
   type AgentState,
+  type AwaitBinding,
   type AwaitKind,
   type AwaitPoint,
   type AwaitResolveOutcome,

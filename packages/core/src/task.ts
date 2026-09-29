@@ -22,6 +22,7 @@
 import { randomUUID } from "node:crypto";
 import {
   EffectNeedsReconciliationError,
+  hashRequest,
   runEffect,
   type EffectJournal,
   type EffectRecord,
@@ -41,6 +42,23 @@ export const TASK_TERMINAL_STATUSES: readonly TaskStatus[] = ["COMPLETED", "CANC
 export type AwaitKind = "USER" | "APPROVAL" | "TIME" | "EXTERNAL" | "RECONCILIATION";
 
 export type AwaitStatus = "PENDING" | "RESOLVED" | "CANCELLED";
+
+/**
+ * What an await authorizes — a non-secret, inspectable identity. For APPROVAL
+ * awaits this binds the approval to the effect kind plus the canonical
+ * request hash: approving request A can never silently authorize a drifted
+ * request B under the same effect name (and legacy waits without a binding
+ * fail closed — they authorize nothing).
+ */
+export interface AwaitBinding {
+  kind: string;
+  requestHash: string;
+}
+
+/** Reserved ref prefix for the adapter-owned EXTERNAL wait. */
+export function adapterWaitRef(adapterId: string): string {
+  return `adapter:${adapterId}`;
+}
 
 /**
  * Reference to the agent-side continuation material. Opaque to Relay: the
@@ -84,9 +102,12 @@ export interface AwaitPoint {
   reason: string;
   /**
    * Optional gated-entity reference. For APPROVAL awaits this is the effect
-   * name the approval unlocks; undefined covers every gated effect.
+   * name the approval unlocks; undefined covers every gated effect. For the
+   * adapter-owned EXTERNAL wait it is `adapter:<adapterId>`.
    */
   ref: string | undefined;
+  /** Non-secret identity of what this wait authorizes (APPROVAL waits). */
+  binding: AwaitBinding | undefined;
   createdAt: number;
   resolvedAt: number | undefined;
 }
@@ -182,6 +203,18 @@ export interface TaskStore {
   ): Promise<void>;
 
   insertAwait(await_: AwaitPoint, events?: readonly TaskEventInput[]): Promise<void>;
+  /**
+   * Atomic parking: await row + events + WAITING transition in ONE commit,
+   * guarded to ACTIVE|WAITING sources. Returns the post-update task, or
+   * undefined when the guard rejected the park (nothing committed). A crash
+   * after this returns can never leave "await committed, task still ACTIVE".
+   */
+  parkAwait(
+    taskId: string,
+    await_: AwaitPoint,
+    at: number,
+    events?: readonly TaskEventInput[],
+  ): Promise<DurableTask | undefined>;
   getAwait(id: string): Promise<AwaitPoint | undefined>;
   awaits(taskId: string): Promise<AwaitPoint[]>;
   pendingAwaits(taskId: string, kind?: AwaitKind): Promise<AwaitPoint[]>;
@@ -220,6 +253,16 @@ export interface AgentState {
 export interface AgentResumeResult {
   /** true when the adapter actually continued agent-side work. */
   resumed: boolean;
+  /**
+   * Explicit recovery semantics (adapters that predate this field report
+   * undefined for every outcome; the runtime maps a bare `{resumed:false}`
+   * to "pending", never to failure):
+   *   completed — the agent leg finished; continuation may run.
+   *   pending   — work is still in flight agent-side; park durably, poll later.
+   *   idle      — legitimately nothing to resume (no deferred run); not an error.
+   *   failed    — the agent leg failed; park resumably, do not continue.
+   */
+  status?: "completed" | "pending" | "idle" | "failed" | undefined;
   detail?: string | undefined;
   /** Adapter-produced output payload (e.g. deferred response text). */
   output?: unknown;
@@ -305,6 +348,7 @@ export interface CreateAwaitInput {
   kind: AwaitKind;
   reason: string;
   ref?: string | undefined;
+  binding?: AwaitBinding | undefined;
   id?: string | undefined;
 }
 
@@ -322,7 +366,8 @@ export type TaskResumeOutcome =
   | { outcome: "completed"; already: boolean }
   | { outcome: "cancelled" }
   | { outcome: "missing" }
-  | { outcome: "blocked"; reason: "capability" | "await-pending" | "effect-unsettled"; awaits?: AwaitPoint[] }
+  | { outcome: "blocked"; reason: "capability" | "await-pending" | "effect-unsettled" | "adapter"; awaits?: AwaitPoint[] }
+  /** Durably parked — e.g. the agent leg is still pending; resume re-polls. */
   | { outcome: "waiting"; awaits: AwaitPoint[] };
 
 export interface TaskResumeContext {
@@ -349,7 +394,13 @@ export interface TaskSnapshot {
   goal: string;
   adapter: string;
   status: TaskStatus;
-  waitingFor: { awaitId: string; kind: AwaitKind; reason: string; ref: string | undefined }[];
+  waitingFor: {
+    awaitId: string;
+    kind: AwaitKind;
+    reason: string;
+    ref: string | undefined;
+    binding: AwaitBinding | undefined;
+  }[];
   confirmed: string[];
   unknowns: string[];
   artifacts: TaskArtifactLink[];
@@ -370,6 +421,38 @@ export class TaskNotActiveError extends Error {
     super(`task ${task.id} is ${task.status}; run task effects only while ACTIVE`);
     this.name = "TaskNotActiveError";
     this.task = task;
+  }
+}
+
+/** Effect execution is refused while any wait is still pending on the task. */
+export class TaskAwaitPendingError extends Error {
+  readonly task: DurableTask;
+  readonly awaits: AwaitPoint[];
+
+  constructor(task: DurableTask, awaits: AwaitPoint[]) {
+    super(
+      `task ${task.id} has ${String(awaits.length)} pending wait(s) ` +
+        `(${awaits.map((a) => a.kind).join(", ")}); resolve them before executing effects`,
+    );
+    this.name = "TaskAwaitPendingError";
+    this.task = task;
+    this.awaits = awaits;
+  }
+}
+
+/** Completion is refused while any effect is PREPARED/SUBMITTED/UNKNOWN. */
+export class TaskUnsettledEffectsError extends Error {
+  readonly taskId: string;
+  readonly effects: { key: string; status: string }[];
+
+  constructor(taskId: string, effects: { key: string; status: string }[]) {
+    super(
+      `task ${taskId} has unsettled effects ` +
+        `(${effects.map((e) => `${e.key}:${e.status}`).join(", ")}); reconcile them first`,
+    );
+    this.name = "TaskUnsettledEffectsError";
+    this.taskId = taskId;
+    this.effects = effects;
   }
 }
 
@@ -459,11 +542,14 @@ export class TaskRuntime {
       status: "PENDING",
       reason: input.reason,
       ref: input.ref,
+      binding: input.binding,
       createdAt: at,
       resolvedAt: undefined,
     };
-    await this.deps.store.insertAwait(await_, [{ type: "WAIT_CREATED", ref: await_.id, at }]);
-    await this.deps.store.transitionTask(taskId, ["ACTIVE", "WAITING"], "WAITING", at);
+    // Await row + WAIT_CREATED + the WAITING transition commit as one unit.
+    await this.deps.store.parkAwait(taskId, await_, at, [
+      { type: "WAIT_CREATED", ref: await_.id, at },
+    ]);
     return await_;
   }
 
@@ -501,14 +587,22 @@ export class TaskRuntime {
     return resolved;
   }
 
-  /** Whether an APPROVAL await covering `ref` (or a blanket approval) resolved. */
-  async isApproved(taskId: string, ref: string): Promise<boolean> {
+  /**
+   * Whether an APPROVAL await bound to THIS spec's (kind, request) resolved.
+   * A resolved legacy await without a binding authorizes nothing — it fails
+   * closed, so an old database can never silently approve a new request.
+   */
+  private async isApprovedFor(taskId: string, spec: TaskEffectSpec): Promise<boolean> {
+    const requestHash = hashRequest(spec.request);
     const awaits = await this.deps.store.awaits(taskId);
     return awaits.some(
       (a) =>
         a.kind === "APPROVAL" &&
         a.status === "RESOLVED" &&
-        (a.ref === undefined || a.ref === ref),
+        (a.ref === undefined || a.ref === spec.name) &&
+        a.binding !== undefined &&
+        a.binding.kind === spec.kind &&
+        a.binding.requestHash === requestHash,
     );
   }
 
@@ -535,17 +629,37 @@ export class TaskRuntime {
         await this.ensureReconciliationAwait(taskId, spec.name, existing);
         return { decision: "needs-reconciliation", effectId: existing.id, status: existing.status };
       }
+      // Read-only reconciliation is never re-gated on approval or pending
+      // waits: it establishes remote truth, it cannot re-execute.
+      return this.executeTaskEffect(taskId, spec);
+    }
+
+    // CONFIRMED/FAILED records are dedup'd inside runEffect — a read-only,
+    // idempotent re-entry that never re-executes, even while parked.
+    if (existing !== undefined && (existing.status === "CONFIRMED" || existing.status === "FAILED")) {
+      return this.executeTaskEffect(taskId, spec);
+    }
+
+    const pending = await this.deps.store.pendingAwaits(taskId);
+    if (pending.length > 0) {
+      throw new TaskAwaitPendingError(task, pending);
     }
 
     if (spec.approvalRequired) {
-      const approved = await this.isApproved(taskId, spec.name);
+      const approved = await this.isApprovedFor(taskId, spec);
       if (!approved) {
-        const await_ = await this.ensureApprovalAwait(taskId, spec.name, spec);
+        const await_ = await this.ensureApprovalAwait(taskId, spec);
         return { decision: "awaiting-approval", awaitId: await_.id };
       }
     }
 
-    const hadRecord = existing !== undefined;
+    return this.executeTaskEffect(taskId, spec);
+  }
+
+  /** Journal + link, no task-level gates (gates live in the callers). */
+  private async executeTaskEffect(taskId: string, spec: TaskEffectSpec): Promise<RunTaskEffectOutcome> {
+    const key = taskEffectKey(taskId, spec.name);
+    const hadRecord = (await this.deps.journal.getByKey(key)) !== undefined;
     const outcome = await runEffect({
       key,
       kind: spec.kind,
@@ -557,26 +671,31 @@ export class TaskRuntime {
       ...(spec.reconcile === undefined ? {} : { reconcile: spec.reconcile }),
       now: this.now,
     });
-
     const record = await this.deps.journal.getByKey(key);
     if (record !== undefined) {
       await this.linkEffect(taskId, record, !hadRecord, outcome);
     }
-    return { decision: "executed", outcome, effectId: record?.id ?? existing?.id ?? "" };
+    return { decision: "executed", outcome, effectId: record?.id ?? "" };
   }
 
-  private async ensureApprovalAwait(
-    taskId: string,
-    name: string,
-    spec: TaskEffectSpec,
-  ): Promise<AwaitPoint> {
+  private async ensureApprovalAwait(taskId: string, spec: TaskEffectSpec): Promise<AwaitPoint> {
+    const binding: AwaitBinding = { kind: spec.kind, requestHash: hashRequest(spec.request) };
     const pending = await this.deps.store.pendingAwaits(taskId, "APPROVAL");
-    const existing = pending.find((a) => a.ref === undefined || a.ref === name);
+    // A pending wait with a DIFFERENT binding never satisfies this spec —
+    // the task parks on a new, correctly-bound wait instead.
+    const existing = pending.find(
+      (a) =>
+        (a.ref === undefined || a.ref === spec.name) &&
+        a.binding !== undefined &&
+        a.binding.kind === binding.kind &&
+        a.binding.requestHash === binding.requestHash,
+    );
     if (existing !== undefined) return existing;
     return this.createAwait(taskId, {
       kind: "APPROVAL",
-      reason: `effect "${name}" (${spec.kind}) requires human approval`,
-      ref: name,
+      reason: `effect "${spec.name}" (${spec.kind}) requires human approval of request ${binding.requestHash.slice(0, 12)}`,
+      ref: spec.name,
+      binding,
     });
   }
 
@@ -699,13 +818,59 @@ export class TaskRuntime {
       }
     }
 
+    // Human/application awaits gate BEFORE the adapter gate: a pending
+    // USER/APPROVAL/app-EXTERNAL wait must never be skipped to poll the
+    // adapter. The only EXTERNAL waits exempted are the adapter-owned ones
+    // (reserved ref `adapter:<id>`), re-polled below once humans cleared.
+    const adapterRef = adapterWaitRef(task.adapter);
     const pending = await this.deps.store.pendingAwaits(taskId);
-    if (pending.length > 0) {
+    const adapterWaits = pending.filter((a) => a.kind === "EXTERNAL" && a.ref === adapterRef);
+    const adapterWait = adapterWaits[0];
+    // Older builds could park more than one adapter-owned wait. The adapter
+    // owns this ref, so duplicates are safe to clear — application EXTERNAL
+    // waits are never touched here.
+    for (const dup of adapterWaits.slice(1)) await this.resolveAwait(dup.id);
+    const blockers = pending.filter((a) => !(a.kind === "EXTERNAL" && a.ref === adapterRef));
+    if (blockers.length > 0) {
       if (task.status !== "WAITING") {
         const at = this.now();
         await this.deps.store.transitionTask(taskId, ["ACTIVE", "BLOCKED"], "WAITING", at);
       }
-      return { outcome: "blocked", reason: "await-pending", awaits: pending };
+      return { outcome: "blocked", reason: "await-pending", awaits: blockers };
+    }
+
+    // Adapter gate: continue the agent leg only once every other gate
+    // cleared. pending/failed park the task durably (resumable later); only
+    // completed/idle let the continuation run.
+    let agent: AgentResumeResult | undefined;
+    const adapter = options.adapter;
+    if (adapter?.resume !== undefined) {
+      agent = await adapter.resume(task.agentRef ?? {}, {
+        task,
+        workspace: options.workspace,
+      });
+      const status = agent.status ?? (agent.resumed ? "completed" : "pending");
+      if (status === "pending" || status === "failed") {
+        // Reuse the existing adapter-owned wait — repeated pending/failed
+        // results must keep exactly one, or the next resume would treat the
+        // duplicate as a blocker and stop re-polling the adapter.
+        const wait =
+          adapterWait ??
+          (await this.createAwait(taskId, {
+            kind: "EXTERNAL",
+            ref: adapterRef,
+            reason: agent.detail ?? `agent leg ${status}`,
+          }));
+        return status === "failed"
+          ? { outcome: "blocked", reason: "adapter", awaits: [wait] }
+          : { outcome: "waiting", awaits: [wait] };
+      }
+      // completed | idle: the agent leg is done or legitimately absent; the
+      // adapter-owned wait — and only that one — clears automatically.
+      if (adapterWait !== undefined) await this.resolveAwait(adapterWait.id);
+    } else if (adapterWait !== undefined) {
+      // A parked adapter wait without an adapter to poll it stays blocked.
+      return { outcome: "blocked", reason: "await-pending", awaits: [adapterWait] };
     }
 
     const at = this.now();
@@ -718,15 +883,6 @@ export class TaskRuntime {
     }
     const resumedTask = (await this.deps.store.getTask(taskId)) ?? task;
 
-    let agent: AgentResumeResult | undefined;
-    const adapter = options.adapter;
-    if (adapter?.resume !== undefined) {
-      agent = await adapter.resume(resumedTask.agentRef ?? {}, {
-        task: resumedTask,
-        workspace: options.workspace,
-      });
-    }
-
     if (options.continuation !== undefined) {
       await options.continuation({ task: resumedTask, runtime: this, adapter, workspace: options.workspace });
     }
@@ -737,31 +893,19 @@ export class TaskRuntime {
    * Re-entry used by the resume gate: like runTaskEffect but tolerant of the
    * task not being ACTIVE (a WAITING/BLOCKED task still gets reconciled).
    */
+  /**
+   * Re-entry used by the resume gate for SUBMITTED/UNKNOWN records only:
+   * journal-level reconciliation — read-only, it can never re-execute — so
+   * it deliberately bypasses the ACTIVE/pending-approval gates that protect
+   * fresh executions in runTaskEffect.
+   */
   private async runTaskEffectGuarded(
     taskId: string,
     spec: TaskEffectSpec,
     task: DurableTask,
   ): Promise<RunTaskEffectOutcome | undefined> {
-    if (task.status !== "ACTIVE") {
-      // Bypass the ACTIVE guard for reconciliation-only re-entries.
-      const key = taskEffectKey(taskId, spec.name);
-      const hadRecord = (await this.deps.journal.getByKey(key)) !== undefined;
-      const outcome = await runEffect({
-        key,
-        kind: spec.kind,
-        request: spec.request,
-        intent: spec.intent,
-        replay: "never",
-        journal: this.deps.journal,
-        execute: spec.execute,
-        ...(spec.reconcile === undefined ? {} : { reconcile: spec.reconcile }),
-        now: this.now,
-      });
-      const record = await this.deps.journal.getByKey(key);
-      if (record !== undefined) await this.linkEffect(taskId, record, !hadRecord, outcome);
-      return { decision: "executed", outcome, effectId: record?.id ?? "" };
-    }
-    return this.runTaskEffect(taskId, spec);
+    void task;
+    return this.executeTaskEffect(taskId, spec);
   }
 
   private specFor(
@@ -795,7 +939,11 @@ export class TaskRuntime {
       }
     }
     return [...byKey.values()].filter(
-      (record) => record.status === "PREPARED" || record.status === "SUBMITTED" || record.status === "UNKNOWN",
+      (record) =>
+        record.status === "PREPARED" ||
+        record.status === "SUBMITTED" ||
+        record.status === "UNKNOWN" ||
+        record.status === "FAILED",
     );
   }
 
@@ -861,7 +1009,13 @@ export class TaskRuntime {
       goal: task.goal,
       adapter: task.adapter,
       status: task.status,
-      waitingFor: pendingAwaits.map((a) => ({ awaitId: a.id, kind: a.kind, reason: a.reason, ref: a.ref })),
+      waitingFor: pendingAwaits.map((a) => ({
+        awaitId: a.id,
+        kind: a.kind,
+        reason: a.reason,
+        ref: a.ref,
+        binding: a.binding,
+      })),
       confirmed,
       unknowns,
       artifacts,
@@ -882,6 +1036,15 @@ export class TaskRuntime {
     const pending = await this.deps.store.pendingAwaits(taskId);
     if (pending.length > 0) {
       throw new Error(`cannot complete: ${String(pending.length)} await(s) still pending`);
+    }
+    // An unsettled effect (PREPARED/SUBMITTED/UNKNOWN) must never be reported
+    // as success: completion is refused until recovery reconciles it.
+    const unsettled = await this.unsettledEffects(taskId);
+    if (unsettled.length > 0) {
+      throw new TaskUnsettledEffectsError(
+        taskId,
+        unsettled.map((e) => ({ key: e.key, status: e.status })),
+      );
     }
     const at = this.now();
     const updated = await this.deps.store.transitionTask(taskId, ["ACTIVE", "WAITING", "BLOCKED"], "COMPLETED", at, [
@@ -983,6 +1146,23 @@ export class MemoryTaskStore implements TaskStore {
   async insertAwait(await_: AwaitPoint, events?: readonly TaskEventInput[]): Promise<void> {
     this.awaitMap.set(await_.id, { ...await_ });
     this.pushEvents(await_.taskId, events);
+  }
+
+  async parkAwait(
+    taskId: string,
+    await_: AwaitPoint,
+    at: number,
+    events?: readonly TaskEventInput[],
+  ): Promise<DurableTask | undefined> {
+    // Validate BEFORE mutating so a rejected park commits nothing.
+    const task = this.tasks.get(taskId);
+    if (task === undefined) return undefined;
+    if (task.status !== "ACTIVE" && task.status !== "WAITING") return undefined;
+    this.awaitMap.set(await_.id, { ...await_ });
+    this.pushEvents(taskId, events);
+    const updated = { ...task, status: "WAITING" as const, updatedAt: at };
+    this.tasks.set(taskId, updated);
+    return { ...updated };
   }
 
   async getAwait(id: string): Promise<AwaitPoint | undefined> {

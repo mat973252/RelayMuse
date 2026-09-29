@@ -12,6 +12,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type {
   AgentRef,
+  AwaitBinding,
   AwaitKind,
   AwaitPoint,
   AwaitResolveOutcome,
@@ -38,14 +39,15 @@ CREATE TABLE IF NOT EXISTS relay_tasks (
   updated_at       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS relay_task_awaits (
-  id          TEXT PRIMARY KEY,
-  task_id     TEXT NOT NULL REFERENCES relay_tasks(id),
-  kind        TEXT NOT NULL CHECK (kind IN ('USER','APPROVAL','TIME','EXTERNAL','RECONCILIATION')),
-  status      TEXT NOT NULL CHECK (status IN ('PENDING','RESOLVED','CANCELLED')),
-  reason      TEXT NOT NULL,
-  ref         TEXT,
-  created_at  INTEGER NOT NULL,
-  resolved_at INTEGER
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL REFERENCES relay_tasks(id),
+  kind         TEXT NOT NULL CHECK (kind IN ('USER','APPROVAL','TIME','EXTERNAL','RECONCILIATION')),
+  status       TEXT NOT NULL CHECK (status IN ('PENDING','RESOLVED','CANCELLED')),
+  reason       TEXT NOT NULL,
+  ref          TEXT,
+  binding_json TEXT,
+  created_at   INTEGER NOT NULL,
+  resolved_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS relay_task_awaits_task ON relay_task_awaits(task_id, status);
 CREATE TABLE IF NOT EXISTS relay_task_events (
@@ -97,6 +99,7 @@ interface AwaitRow {
   status: string;
   reason: string;
   ref: string | null;
+  binding_json: string | null;
   created_at: number;
   resolved_at: number | null;
 }
@@ -145,6 +148,8 @@ function toAwait(row: AwaitRow): AwaitPoint {
     status: row.status as AwaitStatus,
     reason: row.reason,
     ref: row.ref ?? undefined,
+    // Legacy rows have NULL binding_json -> unbound; they fail closed.
+    binding: row.binding_json === null ? undefined : (JSON.parse(row.binding_json) as AwaitBinding),
     createdAt: row.created_at,
     resolvedAt: row.resolved_at ?? undefined,
   };
@@ -170,6 +175,11 @@ export class SqliteTaskStore implements TaskStore {
     db.exec("PRAGMA synchronous = FULL;");
     db.exec("PRAGMA foreign_keys = ON;");
     db.exec(SCHEMA);
+    // Additive migration for databases created before binding_json existed.
+    const cols = db.prepare("PRAGMA table_info(relay_task_awaits)").all() as { name: string }[];
+    if (!cols.some((col) => col.name === "binding_json")) {
+      db.exec("ALTER TABLE relay_task_awaits ADD COLUMN binding_json TEXT");
+    }
     return new SqliteTaskStore(db);
   }
 
@@ -278,23 +288,58 @@ export class SqliteTaskStore implements TaskStore {
 
   async insertAwait(await_: AwaitPoint, events?: readonly TaskEventInput[]): Promise<void> {
     this.transaction(() => {
-      this.db
-        .prepare(
-          `INSERT INTO relay_task_awaits (id, task_id, kind, status, reason, ref, created_at, resolved_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          await_.id,
-          await_.taskId,
-          await_.kind,
-          await_.status,
-          await_.reason,
-          await_.ref ?? null,
-          await_.createdAt,
-          await_.resolvedAt ?? null,
-        );
+      this.insertAwaitRow(await_);
       this.appendEvents(await_.taskId, events);
     });
+  }
+
+  /**
+   * Atomic parking: await row + events + the ACTIVE|WAITING -> WAITING
+   * transition in ONE transaction, guarded so terminal tasks reject the
+   * whole park (no half-committed await row, no orphan event).
+   */
+  async parkAwait(
+    taskId: string,
+    await_: AwaitPoint,
+    at: number,
+    events?: readonly TaskEventInput[],
+  ): Promise<DurableTask | undefined> {
+    let result: DurableTask | undefined;
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM relay_tasks WHERE id = ?").get(taskId) as
+        | TaskRow
+        | undefined;
+      // Guarded park: a missing/terminal task rejects the whole commit —
+      // no await row, no event, no status change leaks through.
+      if (row === undefined) return;
+      if (row.status !== "ACTIVE" && row.status !== "WAITING") return;
+      this.insertAwaitRow(await_);
+      this.appendEvents(taskId, events);
+      this.db
+        .prepare("UPDATE relay_tasks SET status = 'WAITING', updated_at = ? WHERE id = ?")
+        .run(at, taskId);
+      result = toTask({ ...row, status: "WAITING", updated_at: at });
+    });
+    return result;
+  }
+
+  private insertAwaitRow(await_: AwaitPoint): void {
+    this.db
+      .prepare(
+        `INSERT INTO relay_task_awaits (id, task_id, kind, status, reason, ref, binding_json, created_at, resolved_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        await_.id,
+        await_.taskId,
+        await_.kind,
+        await_.status,
+        await_.reason,
+        await_.ref ?? null,
+        await_.binding === undefined ? null : JSON.stringify(await_.binding),
+        await_.createdAt,
+        await_.resolvedAt ?? null,
+      );
   }
 
   async getAwait(id: string): Promise<AwaitPoint | undefined> {

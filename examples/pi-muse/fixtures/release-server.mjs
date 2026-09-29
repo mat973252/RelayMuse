@@ -45,6 +45,11 @@ export async function startReleaseServer(completeAfterMs = 600) {
       req.on("end", () => {
         publishRequests += 1;
         const { key } = JSON.parse(raw || "{}");
+        // "fail-*" keys: a definitive remote rejection (still a counted request,
+        // never a mutation) — exercises the FAILED outcome path.
+        if (typeof key === "string" && key.startsWith("fail-")) {
+          return send(500, { error: "remote rejected the publish" });
+        }
         // Server-side idempotency by key: a second POST for the same key is
         // still a remote REQUEST (counted) but not a second MUTATION.
         if (!published.has(key)) {

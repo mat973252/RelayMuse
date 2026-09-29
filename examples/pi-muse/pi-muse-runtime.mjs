@@ -44,9 +44,12 @@ const publishSpec = {
   intent: `publish ${RELEASE_KEY} to the release server`,
   approvalRequired: true,
   execute: async () => {
+    // connection: close keeps the socket out of undici's keep-alive pool —
+    // a pooled handle mid-close during process.exit() trips libuv's Windows
+    // UV_HANDLE_CLOSING assert (nodejs/node#56645, reproduced on Node 24.13).
     const res = await fetch(`${BASE}/publish`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", connection: "close" },
       body: JSON.stringify({ key: RELEASE_KEY }),
     });
     if (!res.ok) throw new Error(`publish failed: HTTP ${String(res.status)}`);
@@ -61,7 +64,9 @@ const publishSpec = {
   // The journal keeps requestHash, not the request body — the release key
   // comes from the spec's own configuration.
   reconcile: async () => {
-    const res = await fetch(`${BASE}/effects/${encodeURIComponent(RELEASE_KEY)}`);
+    const res = await fetch(`${BASE}/effects/${encodeURIComponent(RELEASE_KEY)}`, {
+      headers: { connection: "close" },
+    });
     if (!res.ok) return { found: false, reason: "remote has no record of this publish" };
     const out = await res.json();
     return { found: true, remoteRef: out.remoteRef, result: out };
@@ -128,10 +133,22 @@ export async function run({ runtime, task }) {
   process.stdout.write(`publish decision: ${outcome.decision}\n`);
 }
 
-/** `task resume` continuation: publish (approved or reconciled), receipt, done. */
+/**
+ * `task resume` continuation: publish (approved or reconciled), receipt, done.
+ * A success receipt + completion require a CONFIRMED outcome only — a failed
+ * or still-unknown publish never writes success evidence or completes the
+ * task. UNKNOWN is reconciled by the resume gate (read-only, never re-POST).
+ */
 export async function continuation({ runtime, task }) {
   const outcome = await runtime.runTaskEffect(task.id, publishSpec);
   process.stdout.write(`publish decision after resume: ${outcome.decision}\n`);
+
+  if (outcome.decision !== "executed" || outcome.outcome.status !== "confirmed") {
+    process.stdout.write(
+      `publish not confirmed (${outcome.decision}${outcome.outcome !== undefined ? `/${outcome.outcome.status}` : ""})\n`,
+    );
+    return;
+  }
 
   const store = await ArtifactStore.open({ root: ARTIFACTS });
   const receipt = await store.write({
