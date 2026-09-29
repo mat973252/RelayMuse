@@ -94,6 +94,7 @@ export function createRelayExtension(options: RelayExtensionOptions = {}) {
 }
 
 export default createRelayExtension();
+export { PiTaskAdapter, type PiTaskAdapterOptions } from "./task-adapter.js";
 export {
   createMockDeferredProvider,
   discoverDeferred,

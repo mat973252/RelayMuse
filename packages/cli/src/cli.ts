@@ -31,6 +31,7 @@ import { exportCapsule, importCapsule } from "./capsule.js";
 import { SqliteEffectJournal, SqliteEffectJournalReader } from "@relay/storage-sqlite";
 import { buildStatusDocument } from "./status.js";
 import { explainEffects } from "./effect-guidance.js";
+import { runTaskCommand } from "./task.js";
 
 const USAGE = `relay — durable execution continuity for AI agents (M2)
 
@@ -45,6 +46,14 @@ usage:
                [--workspace PATH]
   relay import <capsule> [--workspace PATH] [--overwrite]
   relay status [--storage PATH] [--output PATH]
+  relay task create <goal...> [--adapter ID] [--storage PATH] [--json]
+  relay task run <goal...> [--agent pi] [--adapter-module PATH] [--storage PATH]
+  relay task list [--storage PATH] [--json]
+  relay task show <task-id> [--storage PATH]
+  relay task events <task-id> [--storage PATH] [--json]
+  relay task approve <task-id> [--ref NAME] [--storage PATH]
+  relay task resume <task-id> [--adapter-module PATH] [--storage PATH]
+  relay task cancel <task-id> [--storage PATH]
   relay --help
 
 <artifact-ref> accepts a record id, a sha256 digest, or artifact://sha256/<digest>
@@ -477,6 +486,9 @@ export async function main(argv: string[], cwd: string = process.cwd()): Promise
   }
   if (command === "status") {
     return runStatusCommand(rest, cwd);
+  }
+  if (command === "task") {
+    return runTaskCommand(rest, cwd);
   }
   if (command !== "doctor") {
     usageError(`unknown command: ${command}`);

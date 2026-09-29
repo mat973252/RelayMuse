@@ -1,4 +1,14 @@
-# Relay
+# RelayMuse
+
+实验中的持久任务运行层，基于 [Relay](https://github.com/mat973252/Relay)，首个参考应用集成 Pi。保留原项目 MIT 许可证与署名。
+
+当前状态：**PARTIAL / 正在修复**。2026-09-29 独立检查确认现有 226 项回归通过，但发现审批请求绑定、Pi 等待恢复、UNKNOWN 完成门禁及等待事务问题。详见 [独立审查](reports/INDEPENDENT_MUSE_REVIEW_2026-09-29.md)。修复和独立验收前不建议用于真实发布或其他不可逆操作。
+
+`examples/pi-muse` 使用本地 mock provider；尚无真实模型/真实发布服务验收。现有 npm 名称和下方 v0.1 安装说明属于上游 Relay，不是 RelayMuse 已发布版本。`reports/` 中旧 PASS 和发布记录只代表对应日期、对应场景的历史，不代表本仓库已通过 v0.2 验收。
+
+开发：Node 22.13+/24，pnpm 10.33.0；`pnpm install --frozen-lockfile`，`pnpm check`。
+
+## Relay 上游说明（历史基线）
 
 **Durable execution continuity for AI agents.**
 

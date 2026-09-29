@@ -57,3 +57,4 @@ export async function probeSqliteStorage(options: StorageProbeOptions): Promise<
   }
 }
 export { SqliteEpistemicStore, type SqliteEpistemicStoreOptions } from "./epistemic-store.js";
+export { SqliteTaskStore, type SqliteTaskStoreOptions } from "./task-store.js";
