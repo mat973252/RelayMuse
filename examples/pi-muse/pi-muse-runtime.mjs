@@ -128,10 +128,22 @@ export async function run({ runtime, task }) {
   process.stdout.write(`publish decision: ${outcome.decision}\n`);
 }
 
-/** `task resume` continuation: publish (approved or reconciled), receipt, done. */
+/**
+ * `task resume` continuation: publish (approved or reconciled), receipt, done.
+ * A success receipt + completion require a CONFIRMED outcome only — a failed
+ * or still-unknown publish never writes success evidence or completes the
+ * task. UNKNOWN is reconciled by the resume gate (read-only, never re-POST).
+ */
 export async function continuation({ runtime, task }) {
   const outcome = await runtime.runTaskEffect(task.id, publishSpec);
   process.stdout.write(`publish decision after resume: ${outcome.decision}\n`);
+
+  if (outcome.decision !== "executed" || outcome.outcome.status !== "confirmed") {
+    process.stdout.write(
+      `publish not confirmed (${outcome.decision}${outcome.outcome !== undefined ? `/${outcome.outcome.status}` : ""})\n`,
+    );
+    return;
+  }
 
   const store = await ArtifactStore.open({ root: ARTIFACTS });
   const receipt = await store.write({

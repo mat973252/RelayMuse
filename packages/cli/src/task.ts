@@ -196,6 +196,15 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
         }
         const resolved = await deps.runtime.approve(id, args.ref);
         process.stdout.write(`approved ${id}  resolved-awaits ${String(resolved.length)}\n`);
+        // The approval is bound to (kind, requestHash) — print that identity
+        // so a human can see exactly which request was authorized.
+        for (const wait of resolved) {
+          if (wait.binding !== undefined) {
+            process.stdout.write(
+              `  ${wait.ref ?? "?"} kind=${wait.binding.kind} requestHash=${wait.binding.requestHash}\n`,
+            );
+          }
+        }
         return 0;
       }
       case "resume": {

@@ -84,7 +84,13 @@ describe("PiTaskAdapter", () => {
 
       const result = await restarted.resume(ref);
       assert.equal(result.resumed, true);
+      assert.equal((result as { status?: string }).status, "completed");
       assert.ok(String(result.output).length > 0);
+
+      // Resume again after the job completed: no second job submission.
+      const again = await restarted.resume(ref);
+      assert.equal(again.resumed, true);
+      assert.equal((again as { status?: string }).status, "completed");
 
       assert.equal(server.submissions(), 1, "exactly one job submission across attach+restart+resume");
     } finally {
