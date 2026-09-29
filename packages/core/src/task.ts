@@ -168,6 +168,21 @@ export interface TaskArtifactLink {
 
 export type AwaitResolveOutcome = "resolved" | "already-resolved" | "invalid";
 
+/**
+ * Single-writer run lease (stage 2): at most one process may be inside a
+ * task's resume window (recovery gate + adapter + continuation) at a time.
+ * Local/shared-workspace scope only — owner liveness is checked by pid, so
+ * this is a machine-local mutual exclusion, never a distributed lock.
+ */
+export interface TaskRunLease {
+  taskId: string;
+  ownerId: string;
+  ownerPid: number;
+  acquiredAt: number;
+}
+
+export type TaskRunLeaseClaim = { status: "acquired" } | { status: "busy"; owner: TaskRunLease };
+
 // ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
@@ -228,6 +243,23 @@ export interface TaskStore {
   taskArtifacts(taskId: string): Promise<TaskArtifactLink[]>;
 
   taskEvents(taskId: string): Promise<TaskEvent[]>;
+
+  /**
+   * Single-writer run lease. Claims atomically: free row -> acquired; held
+   * row -> busy with the owner record. When `expectedOwnerPid` is given, an
+   * existing row is reclaimed only while its recorded owner pid still equals
+   * it — so two contenders recovering a dead owner cannot both win, and a
+   * live owner is never overwritten.
+   */
+  claimRunLease(
+    taskId: string,
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerPid?: number,
+  ): Promise<TaskRunLeaseClaim>;
+  /** Owner-guarded release — a non-owner can never free another's lease. */
+  releaseRunLease(taskId: string, ownerId: string): Promise<void>;
+  runLease(taskId: string): Promise<TaskRunLease | undefined>;
 }
 
 /**
@@ -368,7 +400,9 @@ export type TaskResumeOutcome =
   | { outcome: "missing" }
   | { outcome: "blocked"; reason: "capability" | "await-pending" | "effect-unsettled" | "adapter"; awaits?: AwaitPoint[] }
   /** Durably parked — e.g. the agent leg is still pending; resume re-polls. */
-  | { outcome: "waiting"; awaits: AwaitPoint[] };
+  | { outcome: "waiting"; awaits: AwaitPoint[] }
+  /** Another live process owns the task's run lease; this resume did nothing. */
+  | { outcome: "busy"; owner: TaskRunLease } ;
 
 export interface TaskResumeContext {
   task: DurableTask;
@@ -386,6 +420,13 @@ export interface ResumeTaskOptions {
   /** Per-call capability override. */
   capabilities?: (() => Promise<ActivationDecision>) | undefined;
   workspace?: string | undefined;
+  /** Run-lease owner identity; defaults to a fresh id on this process. */
+  leaseOwner?: { id?: string | undefined; pid?: number | undefined } | undefined;
+  /**
+   * Test-only seam: pause between the pre-claim snapshot read and the lease
+   * claim, reproducing the stale-snapshot window in real processes.
+   */
+  claimDelayMs?: number | undefined;
 }
 
 /** Derived recovery snapshot — all fields come from durable facts. */
@@ -771,6 +812,63 @@ export class TaskRuntime {
     if (task.status === "COMPLETED") return { outcome: "completed", already: true };
     if (task.status === "CANCELLED") return { outcome: "cancelled" };
 
+    // Single-writer lease (stage 2): the whole resume window — recovery
+    // gate, adapter resume, app continuation — runs under one owner so two
+    // concurrent `task resume` processes can never both reach continuation.
+    // A lease left by a dead owner is reclaimed by pid liveness, never by
+    // timeout: a live owner is never stolen.
+    const owner = {
+      id: options.leaseOwner?.id ?? randomUUID(),
+      pid: options.leaseOwner?.pid ?? process.pid,
+    };
+    // Test seam: pauses a resume between the pre-claim snapshot read and the
+    // lease claim, reproducing the stale-snapshot window in real processes.
+    if (options.claimDelayMs !== undefined && options.claimDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, options.claimDelayMs));
+    }
+    const claim = await this.claimRunLease(taskId, owner);
+    if (claim.status === "busy") return { outcome: "busy", owner: claim.owner };
+    try {
+      // The pre-claim read above is only a fast path: another owner may have
+      // completed or cancelled the task while this resume waited to claim.
+      // Re-read under the lease and gate on the fresh snapshot only.
+      const fresh = await this.deps.store.getTask(taskId);
+      if (fresh === undefined) return { outcome: "missing" };
+      if (fresh.status === "COMPLETED") return { outcome: "completed", already: true };
+      if (fresh.status === "CANCELLED") return { outcome: "cancelled" };
+      return await this.resumeGated(taskId, fresh, options);
+    } finally {
+      await this.deps.store.releaseRunLease(taskId, owner.id);
+    }
+  }
+
+  private async claimRunLease(
+    taskId: string,
+    owner: { id: string; pid: number },
+  ): Promise<TaskRunLeaseClaim> {
+    const claim = await this.deps.store.claimRunLease(taskId, owner, this.now());
+    if (claim.status === "acquired") return claim;
+    if (this.isProcessAlive(claim.owner.ownerPid)) return claim;
+    // The recorded owner is dead; reclaim is guarded by the recorded pid so
+    // two contenders recovering the same stale lease cannot both win.
+    return this.deps.store.claimRunLease(taskId, owner, this.now(), claim.owner.ownerPid);
+  }
+
+  /** pid-existence probe; EPERM means the process exists but is not ours. */
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+  }
+
+  private async resumeGated(
+    taskId: string,
+    task: DurableTask,
+    options: ResumeTaskOptions,
+  ): Promise<TaskResumeOutcome> {
     const capabilities = options.capabilities ?? this.deps.capabilities;
     if (capabilities !== undefined) {
       const decision = await capabilities();
@@ -1053,6 +1151,19 @@ export class TaskRuntime {
     return updated !== undefined;
   }
 
+  /** Park the task in BLOCKED with a diagnostic ref (e.g. failed readiness). */
+  async blockTask(taskId: string, ref: string): Promise<boolean> {
+    const at = this.now();
+    const updated = await this.deps.store.transitionTask(
+      taskId,
+      ["ACTIVE", "WAITING", "BLOCKED"],
+      "BLOCKED",
+      at,
+      [{ type: "TASK_BLOCKED", ref, at }],
+    );
+    return updated !== undefined;
+  }
+
   async cancel(taskId: string): Promise<boolean> {
     const at = this.now();
     const updated = await this.deps.store.transitionTask(
@@ -1214,5 +1325,31 @@ export class MemoryTaskStore implements TaskStore {
 
   async taskEvents(taskId: string): Promise<TaskEvent[]> {
     return this.events.filter((e) => e.taskId === taskId).map((e) => ({ ...e }));
+  }
+
+  private readonly runLeases = new Map<string, TaskRunLease>();
+
+  async claimRunLease(
+    taskId: string,
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerPid?: number,
+  ): Promise<TaskRunLeaseClaim> {
+    const held = this.runLeases.get(taskId);
+    if (held === undefined || (expectedOwnerPid !== undefined && held.ownerPid === expectedOwnerPid)) {
+      const lease: TaskRunLease = { taskId, ownerId: owner.id, ownerPid: owner.pid, acquiredAt: at };
+      this.runLeases.set(taskId, lease);
+      return { status: "acquired" };
+    }
+    return { status: "busy", owner: { ...held } };
+  }
+
+  async releaseRunLease(taskId: string, ownerId: string): Promise<void> {
+    if (this.runLeases.get(taskId)?.ownerId === ownerId) this.runLeases.delete(taskId);
+  }
+
+  async runLease(taskId: string): Promise<TaskRunLease | undefined> {
+    const held = this.runLeases.get(taskId);
+    return held === undefined ? undefined : { ...held };
   }
 }

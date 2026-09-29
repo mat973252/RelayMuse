@@ -319,3 +319,69 @@ describe("SqliteTaskStore atomic parking (stage 1)", () => {
     store.close();
   });
 });
+
+describe("SqliteTaskStore run lease (stage 2)", () => {
+  it("claim is atomic: first owner wins, a second claim reports busy with the owner row", async () => {
+    const path = dbPath();
+    const store = await SqliteTaskStore.open({ path });
+    await store.insertTask(taskFixture("t-lock"));
+
+    const first = await store.claimRunLease("t-lock", { id: "owner-a", pid: 111 }, 5_000);
+    assert.equal(first.status, "acquired");
+    const second = await store.claimRunLease("t-lock", { id: "owner-b", pid: 222 }, 5_001);
+    assert.equal(second.status, "busy");
+    if (second.status === "busy") {
+      assert.equal(second.owner.ownerId, "owner-a");
+      assert.equal(second.owner.ownerPid, 111);
+    }
+    store.close();
+  });
+
+  it("the lease row persists across close/reopen (a crashed owner leaves it behind)", async () => {
+    const path = dbPath();
+    const first = await SqliteTaskStore.open({ path });
+    await first.insertTask(taskFixture("t-lock2"));
+    await first.claimRunLease("t-lock2", { id: "owner-a", pid: 111 }, 5_000);
+    first.close();
+
+    const second = await SqliteTaskStore.open({ path });
+    const lease = await second.runLease("t-lock2");
+    assert.equal(lease?.ownerId, "owner-a");
+    assert.equal(lease?.ownerPid, 111);
+    second.close();
+  });
+
+  it("reclaim is guarded by the expected owner pid — two contenders cannot both win", async () => {
+    const path = dbPath();
+    const store = await SqliteTaskStore.open({ path });
+    await store.insertTask(taskFixture("t-lock3"));
+    await store.claimRunLease("t-lock3", { id: "dead-owner", pid: 999 }, 5_000);
+
+    // A stale-owner reclaim succeeds only when the recorded pid matches.
+    const wrong = await store.claimRunLease("t-lock3", { id: "owner-b", pid: 222 }, 5_001, 888);
+    assert.equal(wrong.status, "busy");
+    const reclaim = await store.claimRunLease("t-lock3", { id: "owner-b", pid: 222 }, 5_001, 999);
+    assert.equal(reclaim.status, "acquired");
+    const lease = await store.runLease("t-lock3");
+    assert.equal(lease?.ownerId, "owner-b");
+
+    // Once reclaimed, a second contender seeing the OLD pid loses.
+    const loser = await store.claimRunLease("t-lock3", { id: "owner-c", pid: 333 }, 5_002, 999);
+    assert.equal(loser.status, "busy");
+    store.close();
+  });
+
+  it("release is owner-guarded and frees the row for the next claim", async () => {
+    const path = dbPath();
+    const store = await SqliteTaskStore.open({ path });
+    await store.insertTask(taskFixture("t-lock4"));
+    await store.claimRunLease("t-lock4", { id: "owner-a", pid: 111 }, 5_000);
+    await store.releaseRunLease("t-lock4", "owner-b");
+    assert.equal((await store.runLease("t-lock4"))?.ownerId, "owner-a");
+    await store.releaseRunLease("t-lock4", "owner-a");
+    assert.equal(await store.runLease("t-lock4"), undefined);
+    const again = await store.claimRunLease("t-lock4", { id: "owner-b", pid: 222 }, 5_001);
+    assert.equal(again.status, "acquired");
+    store.close();
+  });
+});

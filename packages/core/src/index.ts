@@ -98,6 +98,8 @@ export {
   type TaskEventType,
   type TaskResumeContext,
   type TaskResumeOutcome,
+  type TaskRunLease,
+  type TaskRunLeaseClaim,
   type TaskRuntimeDeps,
   type TaskSnapshot,
   type TaskStatus,

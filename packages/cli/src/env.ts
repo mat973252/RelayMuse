@@ -24,3 +24,14 @@ export function envHeaderValue(name: string): string | undefined {
   const value = process.env[name];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
+
+/**
+ * Numeric value for `RELAY_TEST_*` debug/test knobs only. Never used for
+ * probe headers or persisted anywhere.
+ */
+export function envNumber(name: string): number | undefined {
+  const value = process.env[name];
+  if (value === undefined || value === "") return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}

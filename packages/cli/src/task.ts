@@ -25,6 +25,7 @@ import {
   type EffectJournal,
 } from "@relay/core";
 import { SqliteEffectJournal, SqliteEpistemicStore, SqliteTaskStore } from "@relay/storage-sqlite";
+import { envNumber } from "./env.js";
 
 interface TaskCliDeps {
   runtime: TaskRuntime;
@@ -217,6 +218,10 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
           continuation: mod.continuation,
           capabilities: mod.capabilities,
           workspace: cwd,
+          // Test-only seam (RELAY_TEST_LEASE_CLAIM_DELAY_MS): pauses between
+          // the pre-claim read and the lease claim to reproduce the
+          // stale-snapshot window in a real process.
+          claimDelayMs: envNumber("RELAY_TEST_LEASE_CLAIM_DELAY_MS"),
         });
         switch (outcome.outcome) {
           case "resumed":
@@ -231,6 +236,11 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
           case "blocked":
             process.stdout.write(`blocked ${id}  reason=${outcome.reason}\n`);
             return outcome.reason === "await-pending" ? 1 : 2;
+          case "busy":
+            // Another live process owns this task's run lease — a distinct
+            // non-success outcome, never a second run.
+            process.stdout.write(`busy ${id}  owner-pid=${String(outcome.owner.ownerPid)}\n`);
+            return 2;
           case "cancelled":
             process.stdout.write(`cancelled ${id}\n`);
             return 2;
