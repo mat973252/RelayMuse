@@ -763,7 +763,7 @@ export const adapter = {
       process.kill(process.pid, "SIGKILL");
     }
     // Hold the lease long enough for a contending resume to lose.
-    await new Promise((r) => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, Number(process.env.LOCK_SLEEP_MS ?? 2500)));
     return { resumed: true, status: "completed" };
   },
 };
@@ -852,6 +852,82 @@ export async function continuation({ runtime, task }) {
       await server.stop();
     }
   });
+
+  it("a child delayed before claiming re-reads the task: stale ACTIVE never reaches continuation", { timeout: 300_000 }, async () => {
+    const { startReleaseServer } = (await import(
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
+    )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
+    const server = await startReleaseServer(50);
+    const mark = join(tmp, "mark-lease-stale");
+    mkdirSync(mark, { recursive: true });
+    const ws = mkdtempSync(join(tmp, "lease-ws3-"));
+    const modPath = writeLockModule();
+    const env = { MARK_DIR: mark, MUSE_SERVER_URL: server.baseUrl };
+    try {
+      const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env, ws);
+      assert.equal(run.status, 0, run.stderr);
+      const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+      // B reads the pre-claim ACTIVE snapshot, then stalls before claiming.
+      const b = runCliAsync(
+        ["task", "resume", id, "--adapter-module", modPath],
+        { ...env, RELAY_TEST_LEASE_CLAIM_DELAY_MS: "2500" },
+        ws,
+      );
+      // Let B boot, read the snapshot, and enter the pre-claim delay.
+      await new Promise((r) => setTimeout(r, 900));
+
+      // A claims, runs the whole resume, and completes before B's claim.
+      const a = await runCliAsync(
+        ["task", "resume", id, "--adapter-module", modPath],
+        { ...env, LOCK_SLEEP_MS: "100" },
+        ws,
+      );
+      assert.equal(a.status, 0, a.err || a.out);
+      assert.equal(
+        JSON.parse(runCliEnv(["task", "show", id], env, ws).stdout ?? "{}").status,
+        "COMPLETED",
+      );
+
+      const bResult = await b;
+      assert.equal(bResult.status, 0, `B should exit success-already-completed: ${bResult.out} ${bResult.err}`);
+      assert.match(bResult.out, /completed .+ \(already\)/);
+      assert.equal(markerCount(mark, "continued"), 1, "continuation ran exactly once (A only)");
+      assert.equal(markerCount(mark, "adapter-calls"), 1, "B never reached the adapter");
+      const state = await server.state();
+      assert.equal(state.publishRequests, 1);
+      assert.equal(state.mutations, 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("a child delayed before claiming sees a task cancelled mid-window and exits non-success", { timeout: 300_000 }, async () => {
+    const mark = join(tmp, "mark-lease-stale-cancel");
+    mkdirSync(mark, { recursive: true });
+    const ws = mkdtempSync(join(tmp, "lease-ws4-"));
+    const modPath = writeLockModule();
+    const env = { MARK_DIR: mark };
+
+    const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env, ws);
+    assert.equal(run.status, 0, run.stderr);
+    const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+    const b = runCliAsync(
+      ["task", "resume", id, "--adapter-module", modPath],
+      { ...env, RELAY_TEST_LEASE_CLAIM_DELAY_MS: "2000" },
+      ws,
+    );
+    await new Promise((r) => setTimeout(r, 900));
+    const cancel = runCliEnv(["task", "cancel", id], env, ws);
+    assert.equal(cancel.status, 0, cancel.stderr);
+
+    const bResult = await b;
+    assert.equal(bResult.status, 2, `cancelled must be non-success: ${bResult.out} ${bResult.err}`);
+    assert.match(bResult.out, /cancelled/);
+    assert.equal(markerCount(mark, "continued"), 0, "no continuation for a cancelled task");
+    assert.equal(markerCount(mark, "adapter-calls"), 0, "no adapter call for a cancelled task");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -883,6 +959,7 @@ describe("pi-muse release readiness (stage 2)", () => {
       const shown = await runCliAsync(["task", "show", id], env, ws);
       const snap = JSON.parse(shown.out) as {
         status: string;
+        artifacts: { role: string; artifactId: string }[];
         investigation?: { claims: { belief: string }[] };
       };
       assert.equal(snap.status, "BLOCKED");
@@ -891,6 +968,28 @@ describe("pi-muse release readiness (stage 2)", () => {
         "rejected",
         "the releasable belief is rejected by the real failing exit code",
       );
+
+      // The evidence artifact itself must record the real command + exit 1 —
+      // the blocking is derived from an actual child test run, not text.
+      const { ArtifactStore } = (await import(
+        new URL("../../../../packages/artifact-fs/dist/src/index.js", import.meta.url).href
+      )) as {
+        ArtifactStore: {
+          open: (o: { root: string }) => Promise<{
+            resolve: (id: string) => Promise<{ artifactId: string } | undefined>;
+            content: (r: { artifactId: string }) => Promise<Buffer>;
+          }>;
+        };
+      };
+      const artifactStore = await ArtifactStore.open({ root: join(ws, ".relay", "artifacts") });
+      const evLink = snap.artifacts.find((a) => a.role === "evidence");
+      assert.ok(evLink, "the failing test run must leave an evidence artifact");
+      const evRecord = await artifactStore.resolve(evLink.artifactId);
+      assert.ok(evRecord, "the evidence artifact resolves in the store");
+      const evBody = (await artifactStore.content(evRecord)).toString("utf8");
+      assert.match(evBody, /command=.*test\.mjs/, "evidence records the real test command");
+      assert.match(evBody, /exitCode=1/, "evidence records the real failing exit code");
+      assert.match(evBody, /result=fail/, "evidence records the failing result");
 
       // Resume after restart still refuses: BLOCKED -> adapter leg clears,
       // then the rejected belief refuses the publish — no receipt, no decision.

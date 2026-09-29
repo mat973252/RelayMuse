@@ -18,6 +18,7 @@ import {
   hashRequest,
   type AgentAdapter,
   type AgentResumeResult,
+  type DurableTask,
   type EffectJournal,
   type EffectRecord,
   type EffectStatus,
@@ -929,6 +930,84 @@ describe("task run lease — single writer (stage 2)", () => {
     await store.releaseRunLease(task.id, "owner-b");
     const lease = await store.runLease(task.id);
     assert.equal(lease?.ownerId, "owner-a", "the real owner still holds the lease");
+  });
+
+  it("a contender paused between read and claim sees the fresh COMPLETED state", async () => {
+    const { runtime, store } = rig();
+    const calls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    let continued = 0;
+    const continuation = async (ctx: { task: DurableTask }) => {
+      continued += 1;
+      await runtime.complete(ctx.task.id);
+    };
+
+    // B reads the ACTIVE snapshot, then is scheduled out before claiming.
+    // A wins, runs the whole resume, completes, and releases the lease.
+    const origClaim = store.claimRunLease.bind(store);
+    let bPaused!: () => void;
+    let bResume!: () => void;
+    const paused = new Promise<void>((r) => (bPaused = r));
+    const resume = new Promise<void>((r) => (bResume = r));
+    let first = true;
+    store.claimRunLease = async (id, owner, at, expected) => {
+      if (first) {
+        first = false;
+        bPaused();
+        await resume;
+      }
+      return origClaim(id, owner, at, expected);
+    };
+
+    const pB = runtime.resume(task.id, { adapter: countingAdapter(calls), continuation });
+    await paused;
+
+    const a = await runtime.resume(task.id, { adapter: countingAdapter(calls), continuation });
+    assert.equal(a.outcome, "resumed");
+    assert.equal((await store.getTask(task.id))?.status, "COMPLETED");
+
+    bResume();
+    const b = await pB;
+    assert.equal(b.outcome, "completed", "B must observe the fresh terminal state under the lease");
+    assert.equal(calls.resume, 1, "only the first resume reached the adapter");
+    assert.equal(continued, 1, "only the first resume reached continuation");
+  });
+
+  it("a contender paused between read and claim sees the fresh CANCELLED state", async () => {
+    const { runtime, store } = rig();
+    const calls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    let continued = 0;
+
+    const origClaim = store.claimRunLease.bind(store);
+    let bPaused!: () => void;
+    let bResume!: () => void;
+    const paused = new Promise<void>((r) => (bPaused = r));
+    const resume = new Promise<void>((r) => (bResume = r));
+    let first = true;
+    store.claimRunLease = async (id, owner, at, expected) => {
+      if (first) {
+        first = false;
+        bPaused();
+        await resume;
+      }
+      return origClaim(id, owner, at, expected);
+    };
+
+    const pB = runtime.resume(task.id, {
+      adapter: countingAdapter(calls),
+      continuation: async () => {
+        continued += 1;
+      },
+    });
+    await paused;
+    assert.equal(await runtime.cancel(task.id), true);
+
+    bResume();
+    const b = await pB;
+    assert.equal(b.outcome, "cancelled");
+    assert.equal(calls.resume, 0, "cancelled task must never reach the adapter");
+    assert.equal(continued, 0, "cancelled task must never reach continuation");
   });
 
   it("the lease covers the whole resume: it is held while the continuation runs", async () => {

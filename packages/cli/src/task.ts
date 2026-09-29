@@ -25,6 +25,7 @@ import {
   type EffectJournal,
 } from "@relay/core";
 import { SqliteEffectJournal, SqliteEpistemicStore, SqliteTaskStore } from "@relay/storage-sqlite";
+import { envNumber } from "./env.js";
 
 interface TaskCliDeps {
   runtime: TaskRuntime;
@@ -217,6 +218,10 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
           continuation: mod.continuation,
           capabilities: mod.capabilities,
           workspace: cwd,
+          // Test-only seam (RELAY_TEST_LEASE_CLAIM_DELAY_MS): pauses between
+          // the pre-claim read and the lease claim to reproduce the
+          // stale-snapshot window in a real process.
+          claimDelayMs: envNumber("RELAY_TEST_LEASE_CLAIM_DELAY_MS"),
         });
         switch (outcome.outcome) {
           case "resumed":

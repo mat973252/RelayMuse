@@ -422,6 +422,11 @@ export interface ResumeTaskOptions {
   workspace?: string | undefined;
   /** Run-lease owner identity; defaults to a fresh id on this process. */
   leaseOwner?: { id?: string | undefined; pid?: number | undefined } | undefined;
+  /**
+   * Test-only seam: pause between the pre-claim snapshot read and the lease
+   * claim, reproducing the stale-snapshot window in real processes.
+   */
+  claimDelayMs?: number | undefined;
 }
 
 /** Derived recovery snapshot — all fields come from durable facts. */
@@ -816,10 +821,22 @@ export class TaskRuntime {
       id: options.leaseOwner?.id ?? randomUUID(),
       pid: options.leaseOwner?.pid ?? process.pid,
     };
+    // Test seam: pauses a resume between the pre-claim snapshot read and the
+    // lease claim, reproducing the stale-snapshot window in real processes.
+    if (options.claimDelayMs !== undefined && options.claimDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, options.claimDelayMs));
+    }
     const claim = await this.claimRunLease(taskId, owner);
     if (claim.status === "busy") return { outcome: "busy", owner: claim.owner };
     try {
-      return await this.resumeGated(taskId, task, options);
+      // The pre-claim read above is only a fast path: another owner may have
+      // completed or cancelled the task while this resume waited to claim.
+      // Re-read under the lease and gate on the fresh snapshot only.
+      const fresh = await this.deps.store.getTask(taskId);
+      if (fresh === undefined) return { outcome: "missing" };
+      if (fresh.status === "COMPLETED") return { outcome: "completed", already: true };
+      if (fresh.status === "CANCELLED") return { outcome: "cancelled" };
+      return await this.resumeGated(taskId, fresh, options);
     } finally {
       await this.deps.store.releaseRunLease(taskId, owner.id);
     }

@@ -125,7 +125,12 @@ const publishSpec = {
     // Chaos seam: the remote committed; the process dies before the local
     // journal learns the outcome -> the record stays SUBMITTED.
     if (process.env.MUSE_CRASH_AFTER_PUBLISH === "1") {
+      // Verifiable crash evidence: `kill-intent` is written at the expected
+      // crash point; `after-kill` must never exist — reaching it means the
+      // kill did not actually happen.
+      writeFileSync(join(CWD, ".relay", "kill-intent"), `SIGKILL intended at ${new Date().toISOString()}\n`);
       process.kill(process.pid, "SIGKILL");
+      writeFileSync(join(CWD, ".relay", "after-kill"), "reached past the kill point\n");
     }
     return out;
   },
