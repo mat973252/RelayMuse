@@ -464,5 +464,258 @@ export async function continuation({ runtime, task }) {
       await server.stop();
     }
   });
+
+  it("pending -> pending -> completed re-polls the adapter and keeps exactly one adapter wait", () => {
+    const mark = join(tmp, "mark-pending-pending");
+    mkdirSync(mark, { recursive: true });
+    const modPath = writeModule(`
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.env.MARK_DIR;
+const count = (n) => { const f = join(dir, n + ".count"); return existsSync(f) ? readFileSync(f, "utf8").length : 0; };
+const bump = (n) => { appendFileSync(join(dir, n + ".count"), "x"); return count(n); };
+export const adapter = {
+  id: "pi",
+  resume: async () => {
+    const n = bump("polls");
+    return n < 3
+      ? { resumed: false, status: "pending", detail: "deferred run still pending" }
+      : { resumed: true, status: "completed", output: "done" };
+  },
+};
+export async function run({ task }) { process.stdout.write("ran " + task.id + "\\n"); }
+export async function continuation({ task }) {
+  bump("continued");
+  process.stdout.write("continued " + task.id + "\\n");
+}
+`);
+    const env = { MARK_DIR: mark };
+    const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env);
+    const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+    for (const n of [1, 2]) {
+      const r = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env);
+      assert.equal(r.status, 1, `resume ${n} must wait: ${r.stdout}`);
+      assert.match(r.stdout ?? "", /waiting/);
+    }
+    // Each resume is a fresh process on the same storage.db: still one wait.
+    const shown = JSON.parse(runCliEnv(["task", "show", id], env).stdout ?? "{}") as {
+      waitingFor: { kind: string; ref?: string }[];
+    };
+    assert.equal(
+      shown.waitingFor.filter((w) => w.kind === "EXTERNAL").length,
+      1,
+      "repeated pending must park exactly one adapter-owned wait",
+    );
+    assert.equal(markerCount(mark, "polls"), 2, "the adapter is re-polled, not blocked on its own wait");
+
+    const third = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env);
+    assert.equal(third.status, 0, third.stderr);
+    assert.equal(markerCount(mark, "polls"), 3);
+    assert.equal(markerCount(mark, "continued"), 1, "continuation runs exactly once");
+    const done = JSON.parse(runCliEnv(["task", "show", id], env).stdout ?? "{}") as {
+      waitingFor: unknown[];
+    };
+    assert.equal(done.waitingFor.length, 0, "the adapter wait clears on completion");
+  });
+
+  it("failed -> failed -> completed re-polls the adapter and keeps exactly one adapter wait", () => {
+    const mark = join(tmp, "mark-failed-failed");
+    mkdirSync(mark, { recursive: true });
+    const modPath = writeModule(`
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.env.MARK_DIR;
+const count = (n) => { const f = join(dir, n + ".count"); return existsSync(f) ? readFileSync(f, "utf8").length : 0; };
+const bump = (n) => { appendFileSync(join(dir, n + ".count"), "x"); return count(n); };
+export const adapter = {
+  id: "pi",
+  resume: async () => {
+    const n = bump("polls");
+    return n < 3
+      ? { resumed: false, status: "failed", detail: "transport error" }
+      : { resumed: true, status: "completed", output: "done" };
+  },
+};
+export async function run({ task }) { process.stdout.write("ran " + task.id + "\\n"); }
+export async function continuation({ task }) {
+  bump("continued");
+  process.stdout.write("continued " + task.id + "\\n");
+}
+`);
+    const env = { MARK_DIR: mark };
+    const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env);
+    const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+    for (const n of [1, 2]) {
+      const r = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env);
+      assert.notEqual(r.status, 0, `resume ${n} must block: ${r.stdout}`);
+      assert.match(r.stdout ?? "", /blocked/);
+    }
+    const shown = JSON.parse(runCliEnv(["task", "show", id], env).stdout ?? "{}") as {
+      waitingFor: { kind: string; ref?: string }[];
+    };
+    assert.equal(shown.waitingFor.filter((w) => w.kind === "EXTERNAL").length, 1);
+    assert.equal(markerCount(mark, "polls"), 2);
+
+    const third = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env);
+    assert.equal(third.status, 0, third.stderr);
+    assert.equal(markerCount(mark, "polls"), 3);
+    assert.equal(markerCount(mark, "continued"), 1);
+  });
+
+  it("duplicate adapter-owned waits collapse on resume; an app EXTERNAL wait stays pending", () => {
+    const modPath = writeModule(`
+export async function run({ runtime, task }) {
+  // Simulate a previous build that parked two adapter waits plus an app wait.
+  await runtime.createAwait(task.id, { kind: "EXTERNAL", reason: "stale adapter wait", ref: "adapter:pi" });
+  await runtime.createAwait(task.id, { kind: "EXTERNAL", reason: "stale adapter wait 2", ref: "adapter:pi" });
+  await runtime.createAwait(task.id, { kind: "EXTERNAL", reason: "app webhook wait", ref: "app:webhook" });
+}
+export const adapter = {
+  id: "pi",
+  resume: async () => ({ resumed: true, status: "completed" }),
+};
+export async function continuation() {}
+`);
+    const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], {});
+    const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+    const resumed = runCliEnv(["task", "resume", id, "--adapter-module", modPath], {});
+    assert.equal(resumed.status, 1, resumed.stdout ?? "");
+    assert.match(resumed.stdout ?? "", /await-pending|blocked/, "the app wait still gates");
+    const shown = JSON.parse(runCliEnv(["task", "show", id], {}).stdout ?? "{}") as {
+      waitingFor: { kind: string; ref?: string }[];
+    };
+    assert.deepEqual(
+      shown.waitingFor.map((w) => w.ref),
+      ["adapter:pi", "app:webhook"],
+      "adapter-owned duplicates collapse to one; the app wait is never auto-resolved",
+    );
+  });
+
+  it("a FAILED effect refuses completion across process restarts and is never re-executed", () => {
+    const mark = join(tmp, "mark-fail-refuse");
+    mkdirSync(mark, { recursive: true });
+    const modPath = writeModule(`
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
+const dir = process.env.MARK_DIR;
+const bump = (n) => { appendFileSync(join(dir, n + ".count"), "x"); };
+const spec = {
+  name: "publish",
+  kind: "http/publish",
+  request: { r: 1 },
+  approvalRequired: false,
+  execute: async () => {
+    bump("remote");
+    throw new Error("remote rejected");
+  },
+};
+export const effects = [spec];
+export async function run({ runtime, task }) {
+  const o = await runtime.runTaskEffect(task.id, spec);
+  process.stdout.write("decision " + o.decision + " " + (o.outcome ? o.outcome.status : "") + "\\n");
+}
+export async function continuation({ runtime, task }) {
+  const o = await runtime.runTaskEffect(task.id, spec);
+  process.stdout.write("decision " + o.decision + " " + (o.outcome ? o.outcome.status : "") + "\\n");
+  try {
+    await runtime.complete(task.id);
+    process.stdout.write("complete accepted\\n");
+  } catch (err) {
+    process.stdout.write("complete refused: " + String(err && err.message || err) + "\\n");
+  }
+}
+`);
+    const env = { MARK_DIR: mark };
+    const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], env);
+    assert.match(run.stdout ?? "", /decision executed failed/);
+    const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
+
+    for (const n of [1, 2]) {
+      // Each resume is a separate process on the same storage.db (close/reopen).
+      const r = runCliEnv(["task", "resume", id, "--adapter-module", modPath], env);
+      assert.match(
+        r.stdout ?? "",
+        /complete refused/,
+        `resume ${n}: FAILED must refuse completion. out=${r.stdout} err=${r.stderr}`,
+      );
+      assert.doesNotMatch(r.stdout ?? "", /complete accepted/);
+    }
+    assert.equal(markerCount(mark, "remote"), 1, "FAILED is terminal; never blindly re-executed");
+    const shown = JSON.parse(runCliEnv(["task", "show", id], env).stdout ?? "{}") as { status: string };
+    assert.notEqual(shown.status, "COMPLETED");
+  });
+
+  it("crash AFTER remote commit reconciles without re-POSTing (POST=1)", { timeout: 300_000 }, async () => {
+    const { startReleaseServer } = (await import(
+      new URL("../../../../examples/pi-muse/fixtures/release-server.mjs", import.meta.url).href
+    )) as { startReleaseServer: (ms?: number) => Promise<{ baseUrl: string; state: () => Promise<{ publishRequests: number; mutations: number }>; stop: () => Promise<void> }> };
+    const server = await startReleaseServer(50);
+    const ws = mkdtempSync(join(tmp, "crash-ws-"));
+    const modPath = writeModule(`
+const spec = {
+  name: "publish",
+  kind: "http/publish",
+  request: { key: "k1" },
+  approvalRequired: false,
+  execute: async () => {
+    const res = await fetch(process.env.MUSE_SERVER_URL + "/publish", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: "k1" }),
+    });
+    if (!res.ok) throw new Error("publish failed " + res.status);
+    // Remote committed; the journal only holds SUBMITTED when we die here.
+    process.kill(process.pid, "SIGKILL");
+  },
+  reconcile: async () => {
+    const res = await fetch(process.env.MUSE_SERVER_URL + "/effects/k1");
+    if (!res.ok) return { found: "uncertain", reason: "remote unreachable" };
+    const body = await res.json();
+    return { found: true, remoteRef: body.remoteRef, result: body };
+  },
+};
+export const effects = [spec];
+export async function run({ runtime, task }) {
+  await runtime.runTaskEffect(task.id, spec);
+}
+export async function continuation({ runtime, task }) {
+  const o = await runtime.runTaskEffect(task.id, spec);
+  if (o.decision === "executed" && o.outcome && o.outcome.status === "confirmed") {
+    process.stdout.write("publish confirmed; completing\\n");
+    await runtime.complete(task.id);
+  } else {
+    process.stdout.write("publish not confirmed\\n");
+  }
+}
+`);
+    const env = { MUSE_SERVER_URL: server.baseUrl };
+    try {
+      const run = await runCliAsync(["task", "run", "ship", "--adapter-module", modPath], env, ws);
+      const died =
+        run.signal === "SIGKILL" ||
+        (process.platform === "win32" && run.signal === null && run.status !== 0);
+      assert.ok(died, `expected the run process to die after remote commit: ${run.out}`);
+      const id = /task ([0-9a-f-]{36})/.exec(run.out)?.[1] ?? "";
+      const committed = await server.state();
+      assert.equal(committed.publishRequests, 1, "the remote commit landed before the crash");
+      assert.equal(committed.mutations, 1);
+
+      // Fresh process on the same storage.db: reconcile must be read-only.
+      const resumed = await runCliAsync(["task", "resume", id, "--adapter-module", modPath], env, ws);
+      assert.equal(resumed.status, 0, resumed.err || resumed.out);
+      assert.match(resumed.out, /publish confirmed/);
+
+      const after = await server.state();
+      assert.equal(after.publishRequests, 1, "reconciliation is read-only — never a second POST");
+      assert.equal(after.mutations, 1);
+      const shown = await runCliAsync(["task", "show", id], env, ws);
+      assert.equal((JSON.parse(shown.out) as { status: string }).status, "COMPLETED");
+    } finally {
+      await server.stop();
+    }
+  });
 });
 

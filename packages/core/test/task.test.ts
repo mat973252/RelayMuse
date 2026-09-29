@@ -508,6 +508,94 @@ describe("adapter resume semantics (stage 1)", () => {
     assert.equal(after?.status, "PENDING", "only the adapter-owned wait may auto-resolve");
   });
 
+  it("repeated pending results reuse one adapter-owned wait; completion clears it once", async () => {
+    const { runtime } = rig();
+    const adapterCalls = { resume: 0 };
+    let continuationCalls = 0;
+    const adapter = scriptAdapter(adapterCalls, [
+      { resumed: false, status: "pending" },
+      { resumed: false, status: "pending" },
+      { resumed: true, status: "completed" },
+    ]);
+    const task = await runtime.createTask({ goal: "release", adapter: "pi" });
+
+    const first = await runtime.resume(task.id, { adapter });
+    assert.equal(first.outcome, "waiting");
+    const second = await runtime.resume(task.id, { adapter });
+    assert.equal(second.outcome, "waiting", "still pending: re-poll the adapter, never block on its own wait");
+    assert.equal(adapterCalls.resume, 2, "the adapter must be re-polled on every resume");
+    assert.equal((await runtime.pendingAwaits(task.id)).length, 1, "exactly one adapter wait may exist");
+
+    const third = await runtime.resume(task.id, {
+      adapter,
+      continuation: async () => {
+        continuationCalls += 1;
+      },
+    });
+    assert.equal(third.outcome, "resumed");
+    assert.equal(adapterCalls.resume, 3);
+    assert.equal(continuationCalls, 1);
+    assert.equal((await runtime.pendingAwaits(task.id)).length, 0, "the single adapter wait clears on completion");
+  });
+
+  it("repeated failed results reuse one adapter-owned wait; completion clears it once", async () => {
+    const { runtime } = rig();
+    const adapterCalls = { resume: 0 };
+    let continuationCalls = 0;
+    const adapter = scriptAdapter(adapterCalls, [
+      { resumed: false, status: "failed", detail: "transport error" },
+      { resumed: false, status: "failed", detail: "transport error" },
+      { resumed: true, status: "completed" },
+    ]);
+    const task = await runtime.createTask({ goal: "release", adapter: "pi" });
+
+    const first = await runtime.resume(task.id, { adapter });
+    assert.equal(first.outcome, "blocked");
+    const second = await runtime.resume(task.id, { adapter });
+    assert.equal(second.outcome, "blocked");
+    if (second.outcome === "blocked") assert.equal(second.reason, "adapter");
+    assert.equal(adapterCalls.resume, 2, "the adapter must be re-polled, not blocked on its own wait");
+    assert.equal((await runtime.pendingAwaits(task.id)).length, 1);
+
+    const third = await runtime.resume(task.id, {
+      adapter,
+      continuation: async () => {
+        continuationCalls += 1;
+      },
+    });
+    assert.equal(third.outcome, "resumed");
+    assert.equal(adapterCalls.resume, 3);
+    assert.equal(continuationCalls, 1);
+    assert.equal((await runtime.pendingAwaits(task.id)).length, 0);
+  });
+
+  it("legacy duplicate adapter-owned waits collapse on resume; app EXTERNAL waits stay pending", async () => {
+    const { runtime, store } = rig();
+    const adapterCalls = { resume: 0 };
+    const task = await runtime.createTask({ goal: "release", adapter: "pi" });
+    // A previous build parked a second adapter wait; recovery must collapse it.
+    await runtime.createAwait(task.id, { kind: "EXTERNAL", reason: "stale adapter wait", ref: "adapter:pi" });
+    await runtime.createAwait(task.id, { kind: "EXTERNAL", reason: "stale adapter wait 2", ref: "adapter:pi" });
+    const appWait = await runtime.createAwait(task.id, {
+      kind: "EXTERNAL",
+      reason: "waiting on a webhook",
+      ref: "app:webhook",
+    });
+
+    const outcome = await runtime.resume(task.id, {
+      adapter: scriptAdapter(adapterCalls, [{ resumed: true, status: "completed" }]),
+    });
+    assert.equal(outcome.outcome, "blocked", "the application wait still gates continuation");
+    assert.equal(adapterCalls.resume, 0, "the app gate precedes the adapter poll");
+    const pending = await runtime.pendingAwaits(task.id);
+    assert.deepEqual(
+      pending.map((w) => w.ref),
+      ["adapter:pi", "app:webhook"],
+      "adapter-owned duplicates collapse to one; the app wait is never auto-resolved",
+    );
+    assert.equal((await store.getAwait(appWait.id))?.status, "PENDING");
+  });
+
   it("a pending human approval is never bypassed by an adapter-pending wait", async () => {
     const { runtime } = rig();
     const adapterCalls = { resume: 0 };
@@ -700,8 +788,9 @@ describe("completion gate (stage 1)", () => {
     await assert.rejects(() => runtime.complete(task.id), /unsettled|pending/i);
   });
 
-  it("a FAILED (settled) effect does not block completion — the app decides", async () => {
-    const { runtime } = rig();
+  it("a FAILED effect blocks completion — a task must never report success over a failed effect", async () => {
+    const { runtime, journal } = rig();
+    const counters = { remote: 0 };
     const task = await runtime.createTask({ goal: "release", adapter: "pi" });
     const failing: TaskEffectSpec = {
       name: "publish",
@@ -709,12 +798,19 @@ describe("completion gate (stage 1)", () => {
       request: { release: "pkg-1" },
       approvalRequired: false,
       execute: async () => {
+        counters.remote += 1;
         throw new Error("remote rejected");
       },
     };
     const outcome = await runtime.runTaskEffect(task.id, failing);
     if (outcome.decision === "executed") assert.equal(outcome.outcome.status, "failed");
-    assert.equal(await runtime.complete(task.id), true, "FAILED is definitive; refusal lives in the app layer");
+
+    await assert.rejects(() => runtime.complete(task.id), /unsettled|pending|failed/i);
+    assert.notEqual((await runtime.getTask(task.id))?.status, "COMPLETED");
+
+    // FAILED is terminal, not retried: the journal row stays, remote stays 1.
+    assert.equal(counters.remote, 1, "FAILED must never be blindly re-executed");
+    assert.equal((await journal.getByKey(`task/${task.id}/publish`))?.status, "FAILED");
   });
 
   it("reconciliation is not re-gated on approval (read-only settle)", async () => {

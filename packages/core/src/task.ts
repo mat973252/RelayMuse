@@ -820,12 +820,17 @@ export class TaskRuntime {
 
     // Human/application awaits gate BEFORE the adapter gate: a pending
     // USER/APPROVAL/app-EXTERNAL wait must never be skipped to poll the
-    // adapter. The only EXTERNAL wait exempted is the adapter-owned one
+    // adapter. The only EXTERNAL waits exempted are the adapter-owned ones
     // (reserved ref `adapter:<id>`), re-polled below once humans cleared.
     const adapterRef = adapterWaitRef(task.adapter);
     const pending = await this.deps.store.pendingAwaits(taskId);
-    const adapterWait = pending.find((a) => a.kind === "EXTERNAL" && a.ref === adapterRef);
-    const blockers = pending.filter((a) => a !== adapterWait);
+    const adapterWaits = pending.filter((a) => a.kind === "EXTERNAL" && a.ref === adapterRef);
+    const adapterWait = adapterWaits[0];
+    // Older builds could park more than one adapter-owned wait. The adapter
+    // owns this ref, so duplicates are safe to clear — application EXTERNAL
+    // waits are never touched here.
+    for (const dup of adapterWaits.slice(1)) await this.resolveAwait(dup.id);
+    const blockers = pending.filter((a) => !(a.kind === "EXTERNAL" && a.ref === adapterRef));
     if (blockers.length > 0) {
       if (task.status !== "WAITING") {
         const at = this.now();
@@ -846,11 +851,16 @@ export class TaskRuntime {
       });
       const status = agent.status ?? (agent.resumed ? "completed" : "pending");
       if (status === "pending" || status === "failed") {
-        const wait = await this.createAwait(taskId, {
-          kind: "EXTERNAL",
-          ref: adapterRef,
-          reason: agent.detail ?? `agent leg ${status}`,
-        });
+        // Reuse the existing adapter-owned wait — repeated pending/failed
+        // results must keep exactly one, or the next resume would treat the
+        // duplicate as a blocker and stop re-polling the adapter.
+        const wait =
+          adapterWait ??
+          (await this.createAwait(taskId, {
+            kind: "EXTERNAL",
+            ref: adapterRef,
+            reason: agent.detail ?? `agent leg ${status}`,
+          }));
         return status === "failed"
           ? { outcome: "blocked", reason: "adapter", awaits: [wait] }
           : { outcome: "waiting", awaits: [wait] };
@@ -929,7 +939,11 @@ export class TaskRuntime {
       }
     }
     return [...byKey.values()].filter(
-      (record) => record.status === "PREPARED" || record.status === "SUBMITTED" || record.status === "UNKNOWN",
+      (record) =>
+        record.status === "PREPARED" ||
+        record.status === "SUBMITTED" ||
+        record.status === "UNKNOWN" ||
+        record.status === "FAILED",
     );
   }
 

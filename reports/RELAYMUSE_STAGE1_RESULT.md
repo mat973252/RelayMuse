@@ -1,8 +1,15 @@
-# RELAYMUSE_STAGE1_RESULT — independently reviewed safety repairs
+# RELAYMUSE_STAGE1_RESULT — Devin self-verification (Codex independent acceptance pending)
 
-Date: 2026-09-29. Branch: `devin/stage-1-hardening` (base `2f8f046`). Scope: stage 1 only. No stage-2 work, no schedulers/event systems, no UI, no releases, no real external mutations.
+Date: 2026-09-29 (rework after Codex rejection #1). Branch: `devin/stage-1-hardening` (base `2f8f046`). Scope: stage 1 only. No stage-2 work, no schedulers/event systems, no UI, no releases, no real external mutations.
 
-**RESULT: PASS** — on the scenarios actually exercised below. Verdict limited to what was run; uncovered boundaries are listed at the end.
+**RESULT: PASS (self-verification only)** — on the scenarios actually exercised below. Codex's independent acceptance has NOT passed yet; this documents what Devin ran and verified. Uncovered boundaries are listed at the end.
+
+### Rework items (Codex feedback on `7cb7c0c`)
+
+- **Duplicate adapter waits (P1)**: consecutive `pending`/`failed` results previously parked a second `adapter:<id>` wait, which then blocked every later resume as a foreign blocker — the adapter was never re-polled. Now `resume()` collapses all adapter-owned waits under `adapter:<id>` to a single one (extras resolved — adapter-owned only) before the human/app blocker check, and reuses the existing wait instead of creating a new one.
+- **FAILED slipped past completion (P1)**: `unsettledEffects` excluded `FAILED`, so `complete()` succeeded over a failed effect. `FAILED` is now unsettled → `complete()` throws `TaskUnsettledEffectsError` with the offending `key`/`status` list. FAILED stays terminal — never retried, journal never deleted.
+- `reports/RELAYMUSE_COORDINATION.md` restored to the `main` version (coordination state is Codex-maintained).
+- Report re-titled self-verification; the PASS below is Devin's run, not Codex acceptance.
 
 ## What was fixed (Codex findings 1–4)
 
@@ -33,10 +40,11 @@ Date: 2026-09-29. Branch: `devin/stage-1-hardening` (base `2f8f046`). Scope: sta
 
 | Command | Runtime | Exit | Result |
 |---|---|---|---|
-| `pnpm check` (typecheck `tsc -b` + `pnpm -r test`) | Node v24.19.0, pnpm 10.33.0 | 0 | 253 pass / 0 fail (baseline 226 + 27 new) |
-| `pnpm check` | Node v22.23.3, pnpm 10.33.0 | 0 | 253 pass / 0 fail |
+| `pnpm check` (typecheck `tsc -b` + `pnpm -r test`) | Node v24.19.0, pnpm 10.33.0 | 0 | 261 pass / 0 fail (baseline 226 + 35 new) |
+| `pnpm check` | Node v22.23.3, pnpm 10.33.0 | 0 | 261 pass / 0 fail |
 
-Per-package (both runtimes): epistemic 8, core 65, artifact-fs 12, storage-sqlite 45, cli 60, mcp 55, adapter-pi 8 — all `ℹ fail 0`.
+Per-package (both runtimes): epistemic 8, core 68, artifact-fs 12, storage-sqlite 45, cli 65, mcp 55, adapter-pi 8 — all `ℹ fail 0`.
+GitHub CI matrix on the pushed head: ubuntu+windows × node 22/24 — see the PR checks for the live result.
 
 New behavioral tests were written first and confirmed red before implementation (20+ assertions across the four findings).
 
@@ -46,6 +54,11 @@ New behavioral tests were written first and confirmed red before implementation 
 
 - **Approval request drift**: ask request A → approve → new process, same name request B → B is NOT executed; new bound approval wait required; `task approve` prints `requestHash=`; after approving the drifted wait, remote mutation count = exactly 1.
 - **Slow/pending deferred**: adapter `resume` → `pending` → EXTERNAL wait `adapter:pi` parked, task exits `waiting` (exit 1), no continuation; a later `resume` resolves it and continuation runs once (`adapterCalls===2`, `continued===1`).
+- **pending→pending→completed** (cross-process, NEW): each `task resume` is a separate process on the same `storage.db`; adapter polled on every resume (`polls` 2 → 3), exactly one `adapter:pi` EXTERNAL wait persisted throughout, cleared on completion, continuation ran exactly once.
+- **failed→failed→completed** (cross-process, NEW): same shape with `status:"failed"` — each resume exits blocked (non-zero), adapter re-polled, single wait kept, third resume completes, continuation once.
+- **Legacy duplicate adapter waits** (cross-process, NEW): module seeds two `adapter:pi` waits + one `app:webhook` EXTERNAL wait; resume collapses the adapter dupes to one and leaves the app wait PENDING — `adapter.resume` is never invoked while it gates.
+- **FAILED refuses completion across restarts** (cross-process, NEW): publish `execute` throws → outcome `failed`; two separate `task resume` processes both print `complete refused`, remote marker stays 1 (no blind retry), task never COMPLETED.
+- **Crash after remote commit, POST=1** (cross-process, NEW): module `execute` performs a real HTTP `POST /publish` to the controlled fixture server, then self-`SIGKILL`s before returning — journal holds only SUBMITTED, server `publishRequests=1, mutations=1`. Fresh-process `task resume` reconciles via `GET /effects/:key` (read-only) → CONFIRMED → continuation → receipt + `complete()`. Final `publishRequests=1` — zero duplicate remote mutations.
 - **SIGKILL atomic park**: child killed with real `SIGKILL` mid-park; reopened DB shows `WAITING` + exactly 1 wait row — never `ACTIVE` + pending await.
 - **UNKNOWN blocks completion**: `complete` refused while journal holds UNKNOWN; restart `resume` reconciles read-only (remote POST count stays 1), then completes; CONFIRMED stays deduplicated.
 - **Continuation-hits-UNKNOWN**: refused completion surfaces `complete refused`.
