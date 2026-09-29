@@ -44,9 +44,12 @@ const publishSpec = {
   intent: `publish ${RELEASE_KEY} to the release server`,
   approvalRequired: true,
   execute: async () => {
+    // connection: close keeps the socket out of undici's keep-alive pool —
+    // a pooled handle mid-close during process.exit() hits the unfixed
+    // upstream Windows libuv assert (nodejs/node#56645).
     const res = await fetch(`${BASE}/publish`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", connection: "close" },
       body: JSON.stringify({ key: RELEASE_KEY }),
     });
     if (!res.ok) throw new Error(`publish failed: HTTP ${String(res.status)}`);
@@ -61,7 +64,9 @@ const publishSpec = {
   // The journal keeps requestHash, not the request body — the release key
   // comes from the spec's own configuration.
   reconcile: async () => {
-    const res = await fetch(`${BASE}/effects/${encodeURIComponent(RELEASE_KEY)}`);
+    const res = await fetch(`${BASE}/effects/${encodeURIComponent(RELEASE_KEY)}`, {
+      headers: { connection: "close" },
+    });
     if (!res.ok) return { found: false, reason: "remote has no record of this publish" };
     const out = await res.json();
     return { found: true, remoteRef: out.remoteRef, result: out };
