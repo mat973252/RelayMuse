@@ -1,6 +1,6 @@
 # RelayMuse 协调状态
 
-最后核验：2026-09-29 23:58 Asia/Shanghai。
+最后核验：2026-09-30 Asia/Shanghai。
 
 - 用户授权：Devin Cloud 实现；Codex 管进度和独立验收；建立开源 GitHub 项目。
 - GitHub：https://github.com/mat973252/RelayMuse；PUBLIC / MIT。
@@ -22,6 +22,8 @@
 ## 下一步
 
 ### 最新独立复核（覆盖上方历史状态）
+
+- **2026-09-30 本地子任务推进，阶段三仍 PARTIAL**：用户授权自主选项目，Codex 直接补同步 Pi session 持久结果门禁；公开 getters 精确绑定 session，当前分支正常非空结果可跨进程只读恢复，失败/缺失/损坏/context edit 隐藏结果不得 continuation。离线真实 Pi AgentSession 同步 fixture 与原 deferred 回归通过，详情见 `reports/PI_PERSISTED_RESULT_GATE_2026-09-30.md`。本轮 API 只读复核 Devin 仍 suspended / usage_limit_exceeded，GitHub 无 open PR；没有发消息、加预算或取回未交付代码。旧预算停止点保持；真实 provider 与完整阶段三闭环尚未验收。
 
 - **23:58 阶段三因预算窗口停止，尚未交付/验收**：原session API suspended / usage_limit_exceeded，网页明确 per-message usage limit 自动暂停。网页实际总11.96美元，扣历史2.57、本轮新增9.39/10、剩余0.61；消息窗口仍2美元，该窗口实际计费2.09。余额低于1美元续派门槛，停止发消息，不加预算、不唤醒、不重复session。截图本机devin-stage3-limit-stop.png。
 - GitHub无open PR，remote仅main与阶段一二分支，无阶段三已推送head。网页显示本轮未交付修改+650/-37，不能当作可检出成果或测试通过。阶段一二PASS保持，阶段三只有早前真实ModelRuntime预检通过，真实AgentSession/任务恢复/effect验收未进行。保存当前会话与协调记录，监督自动化因预算停止而暂停；后续继续需处理现有未交付成果及预算边界。
