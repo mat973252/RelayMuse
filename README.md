@@ -2,9 +2,9 @@
 
 实验中的持久任务运行层，基于 [Relay](https://github.com/mat973252/Relay)，首个参考应用集成 Pi。保留原项目 MIT 许可证与署名。
 
-当前状态：**PARTIAL / 阶段3部分完成**。阶段1加固（审批绑定、adapter 恢复语义、完成门禁、原子 park）与阶段2（可移植默认 demo、真实合成 package 测试驱动的 release readiness、artifact lineage、任务单写者锁）已由 Codex 独立验收并合并，见 [阶段1/2独立验收](reports/RELAYMUSE_CODEX_ACCEPTANCE_2026-09-29.md)。2026-09-30 的本地迭代补上同步 Pi session 的持久结果门禁：正常非空最终输出可跨进程读回，失败、缺失或损坏结果阻止 continuation，见 [本轮验收](reports/PI_PERSISTED_RESULT_GATE_2026-09-30.md)。真实 provider 的任务闭环仍未验收，仍不建议用于真实发布或其他不可逆操作。
+当前状态：**阶段3本地受控闭环通过，仍处于实验阶段**。阶段1加固（审批绑定、adapter 恢复语义、完成门禁、原子 park）与阶段2（可移植默认 demo、真实合成 package 测试驱动的 release readiness、artifact lineage、任务单写者锁）已由 Codex 独立验收并合并，见 [阶段1/2独立验收](reports/RELAYMUSE_CODEX_ACCEPTANCE_2026-09-29.md)。2026-09-30 补上[同步 Pi 持久结果门禁](reports/PI_PERSISTED_RESULT_GATE_2026-09-30.md)，并通过真实 Pi AgentSession 模型调用 → 人工审批 → 合成发布提交后强杀 → 并发恢复的本地验收：Pi 侧模型请求1次，模拟发布请求/变更各1次。详见[阶段3结果](reports/RELAYMUSE_STAGE3_RESULT_2026-09-30.md)。真实发布服务及生产安全仍未证明。
 
-`examples/pi-muse` 使用本地 mock provider；尚无真实模型/真实发布服务验收。现有 npm 名称和下方 v0.1 安装说明属于上游 Relay，不是 RelayMuse 已发布版本。`reports/` 中旧 PASS 和发布记录只代表对应日期、对应场景的历史，不代表本仓库已通过 v0.2 验收。
+`examples/pi-muse` 默认使用本地 mock provider；另有[显式 opt-in 的真实模型示例](examples/pi-muse/README.md#真实模型合成验收显式-opt-in)，发布 effect 仍是 localhost fixture。现有 npm 名称和下方 v0.1 安装说明属于上游 Relay，不是 RelayMuse 已发布版本。`reports/` 中旧 PASS 和发布记录只代表对应日期、对应场景的历史，不代表本仓库的当前发布状态。
 
 开发：Node 22.13+/24，pnpm 10.33.0；`pnpm install --frozen-lockfile`，`pnpm check`。
 

@@ -13,14 +13,19 @@
  */
 import type { AgentAdapter, AgentRef, AgentResumeResult, AgentState } from "@relay/core";
 import type { Api, DeferredHandle, Model, Provider } from "@earendil-works/pi-ai";
-import type { FileEntry } from "@earendil-works/pi-coding-agent";
+import type { FileEntry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export interface PiTaskAdapterOptions {
-  /** Model the agent leg runs on (e.g. mockDeferredModel()). */
-  model: Model<Api>;
-  /** Provider to register on the ModelRuntime (e.g. createMockDeferredProvider()). */
-  provider: Provider<Api>;
+  /** Required for attach/deferred polling; persisted synchronous recovery needs no model. */
+  model?: Model<Api>;
+  /** Optional native provider; omit to use the configured ModelRuntime. */
+  provider?: Provider<Api>;
+  /** Pi owns authentication/configuration; this object is never persisted. */
+  modelRuntime?: ModelRuntime;
+  /** Short synthetic calls only: no tools/resources, no retries, 60s deadline. */
+  textOnly?: boolean;
   /** Working directory handed to SessionManager.create. */
   cwd: string;
   /** Directory holding Pi session files (JSONL). */
@@ -40,6 +45,13 @@ export class PiTaskAdapter implements AgentAdapter {
     this.options = options;
   }
 
+  private async modelRuntime(): Promise<ModelRuntime> {
+    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+    const runtime = this.options.modelRuntime ?? await ModelRuntime.create({ refreshOnCreate: false });
+    if (this.options.provider !== undefined) runtime.registerNativeProvider(this.options.provider);
+    return runtime;
+  }
+
   /**
    * Start the agent leg: a real Pi AgentSession on the configured
    * model/provider, prompted once with the task instruction. The returned
@@ -47,18 +59,39 @@ export class PiTaskAdapter implements AgentAdapter {
    * provider deferred, its DeferredHandle — never a session copy.
    */
   async attach(task: { id: string; goal: string }, context: { instruction?: string | undefined } = {}): Promise<AgentRef> {
-    const { ModelRuntime, SessionManager, createAgentSession } = await import(
+    if (this.options.model === undefined) throw new Error("pi attach: a configured model is required");
+    const { DefaultResourceLoader, SettingsManager, SessionManager, createAgentSession } = await import(
       "@earendil-works/pi-coding-agent"
     );
-    const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
-    modelRuntime.registerNativeProvider(this.options.provider);
+    const modelRuntime = await this.modelRuntime();
     const sessionManager = SessionManager.create(this.options.cwd, this.options.sessionDir);
+    const settingsManager = this.options.textOnly ? SettingsManager.inMemory({
+      retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0, timeoutMs: 60_000 } },
+      compaction: { enabled: false }, cacheWarming: "off", packages: [],
+    }) : undefined;
+    const agentDir = join(this.options.sessionDir, "isolated-agent");
+    const resourceLoader = settingsManager === undefined ? undefined : new DefaultResourceLoader({
+      cwd: this.options.cwd, agentDir, settingsManager,
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      systemPrompt: "Return only the requested short synthetic text. No tools or external actions.",
+      appendSystemPrompt: [],
+    });
+    if (resourceLoader !== undefined) await resourceLoader.reload();
     const { session } = await createAgentSession({
+      cwd: this.options.cwd,
       model: this.options.model,
       modelRuntime,
       sessionManager,
+      ...(settingsManager !== undefined ? { settingsManager, resourceLoader: resourceLoader!,
+        agentDir, noTools: "all" as const, tools: [], thinkingLevel: "off" as const } : {}),
     });
-    await session.prompt(context.instruction ?? task.goal);
+    const timer = this.options.textOnly ? setTimeout(() => { void session.abort(); }, 60_000) : undefined;
+    try {
+      await session.prompt(context.instruction ?? task.goal);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      if (this.options.textOnly) session.dispose();
+    }
 
     const sessionId = sessionManager.getSessionId();
     const sessionFile = sessionManager.getSessionFile();
@@ -132,10 +165,9 @@ export class PiTaskAdapter implements AgentAdapter {
     const persisted = await this.readSession(ref);
     const handle = persisted.handle;
     if (handle === undefined) return persisted.result;
+    if (this.options.model === undefined) return { resumed: false, status: "failed", detail: "deferred recovery requires a configured model" };
 
-    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
-    const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
-    modelRuntime.registerNativeProvider(this.options.provider);
+    const modelRuntime = await this.modelRuntime();
 
     const pollMs = this.options.pollMs ?? 50;
     const maxPolls = this.options.maxPolls ?? 40;

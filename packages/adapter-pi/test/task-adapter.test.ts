@@ -5,7 +5,7 @@
  * the provider's submission count stays 1.
  */
 import assert from "node:assert/strict";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -17,7 +17,7 @@ import {
   mockDeferredModel,
 } from "../src/index.js";
 import { startJobServer } from "./fixtures/job-server.js";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 
 function assistant(stopReason: AssistantMessage["stopReason"] = "stop", text = "synthetic result"): AssistantMessage {
@@ -65,6 +65,40 @@ class NopJournal {
 }
 
 describe("PiTaskAdapter", () => {
+  it("uses an injected configured runtime and isolates text-only calls from tools and project resources", async () => {
+    const cwd = join(tmp, "isolation");
+    mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+    writeFileSync(join(cwd, "AGENTS.md"), "PRIVATE_CONTEXT_CANARY");
+    writeFileSync(join(cwd, ".pi", "SYSTEM.md"), "PRIVATE_SYSTEM_CANARY");
+    const marker = join(cwd, "extension-loaded");
+    writeFileSync(join(cwd, ".pi", "extensions", "canary.js"),
+      `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'loaded'); export default () => {};`);
+    let calls = 0;
+    const provider = createMockDeferredProvider({ baseUrl: "http://127.0.0.1:1" });
+    provider.streamSimple = (_model, context, options) => {
+      calls += 1;
+      assert.equal(context.messages.filter((m) => m.role === "system").flatMap((m) => m.toolsAdded ?? []).length, 0);
+      assert.ok(!JSON.stringify(context).includes("PRIVATE_"));
+      assert.equal(options?.maxRetries, 0);
+      const events = createAssistantMessageEventStream();
+      const message = assistant();
+      events.push({ type: "done", reason: "stop", message });
+      return events;
+    };
+    const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null });
+    modelRuntime.registerNativeProvider(provider);
+    const adapter = new PiTaskAdapter({ model: mockDeferredModel(), modelRuntime,
+      textOnly: true, cwd, sessionDir: join(cwd, "sessions") });
+    const ref = await adapter.attach({ id: "isolated", goal: "synthetic instruction" });
+    assert.equal((await adapter.resume(ref)).status, "completed");
+    assert.equal(calls, 1);
+    assert.equal(existsSync(marker), false);
+    assert.ok(!readFileSync(ref.sessionFile!, "utf8").includes("PRIVATE_"));
+    const reader = new PiTaskAdapter({ cwd, sessionDir: join(cwd, "sessions") });
+    assert.equal((await reader.resume(ref)).output, "synthetic result");
+    assert.equal(calls, 1, "read-only recovery needs neither a provider nor credentials");
+  });
+
   it("recovers synchronous output from the exact session without provider calls or writes", async () => {
     const { ref } = persistedSession();
     const other = persistedSession();
