@@ -183,6 +183,8 @@ export interface TaskRunLease {
 
 export type TaskRunLeaseClaim = { status: "acquired" } | { status: "busy"; owner: TaskRunLease };
 
+export type TaskExecutionLeaseClaim = TaskRunLeaseClaim | { status: "inactive"; task: DurableTask | undefined };
+
 // ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
@@ -200,7 +202,8 @@ export interface TaskStore {
    * Guarded status transition + events in one commit. `expected === undefined`
    * accepts any current status; otherwise the update commits only when the
    * current status is in `expected`. Returns the post-update row, or
-   * undefined when the guard rejected the transition.
+   * undefined when the guard rejected the transition. COMPLETED also requires
+   * no pending awaits in this same commit (parking may race completion).
    */
   transitionTask(
     id: string,
@@ -260,6 +263,22 @@ export interface TaskStore {
   /** Owner-guarded release — a non-owner can never free another's lease. */
   releaseRunLease(taskId: string, ownerId: string): Promise<void>;
   runLease(taskId: string): Promise<TaskRunLease | undefined>;
+
+  /**
+   * Independent single-writer lease for task effects and completion checks.
+   * Checking expected task status and claiming MUST be one atomic operation,
+   * serialized with terminal transitions. No DB transaction spans execution.
+   * Cancellation may commit while held; already admitted effects still settle.
+   * Dead-owner reclaim compares the exact owner id, never just a timeout.
+   */
+  claimExecutionLease(
+    taskId: string,
+    expected: readonly TaskStatus[],
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerId?: string,
+  ): Promise<TaskExecutionLeaseClaim>;
+  releaseExecutionLease(taskId: string, ownerId: string): Promise<void>;
 }
 
 /**
@@ -465,6 +484,22 @@ export class TaskNotActiveError extends Error {
   }
 }
 
+/** Another effect or completion check owns this task's execution window. */
+export class TaskExecutionBusyError extends Error {
+  constructor(readonly owner: TaskRunLease) {
+    super(`task ${owner.taskId} execution is busy (owner ${owner.ownerId}, pid ${String(owner.ownerPid)})`);
+    this.name = "TaskExecutionBusyError";
+  }
+}
+
+/** A guarded await commit lost to a lifecycle transition. */
+class TaskAwaitRejectedError extends Error {
+  constructor(task: DurableTask) {
+    super(`cannot await on a ${task.status} task`);
+    this.name = "TaskAwaitRejectedError";
+  }
+}
+
 /** Effect execution is refused while any wait is still pending on the task. */
 export class TaskAwaitPendingError extends Error {
   readonly task: DurableTask;
@@ -573,7 +608,7 @@ export class TaskRuntime {
   async createAwait(taskId: string, input: CreateAwaitInput): Promise<AwaitPoint> {
     const task = await this.requireTask(taskId);
     if (task.status !== "ACTIVE" && task.status !== "WAITING") {
-      throw new Error(`cannot await on a ${task.status} task`);
+      throw new TaskAwaitRejectedError(task);
     }
     const at = this.now();
     const await_: AwaitPoint = {
@@ -588,9 +623,13 @@ export class TaskRuntime {
       resolvedAt: undefined,
     };
     // Await row + WAIT_CREATED + the WAITING transition commit as one unit.
-    await this.deps.store.parkAwait(taskId, await_, at, [
+    const parked = await this.deps.store.parkAwait(taskId, await_, at, [
       { type: "WAIT_CREATED", ref: await_.id, at },
     ]);
+    if (parked === undefined) {
+      const current = await this.requireTask(taskId);
+      throw new TaskAwaitRejectedError(current);
+    }
     return await_;
   }
 
@@ -662,6 +701,21 @@ export class TaskRuntime {
   async runTaskEffect(taskId: string, spec: TaskEffectSpec): Promise<RunTaskEffectOutcome> {
     const task = await this.requireTask(taskId);
     if (task.status !== "ACTIVE") throw new TaskNotActiveError(task);
+    const owner = { id: randomUUID(), pid: process.pid };
+    const claim = await this.claimExecutionLease(taskId, ["ACTIVE"], owner);
+    if (claim.status === "busy") throw new TaskExecutionBusyError(claim.owner);
+    if (claim.status === "inactive") {
+      if (claim.task === undefined) throw new Error(`unknown task ${taskId}`);
+      throw new TaskNotActiveError(claim.task);
+    }
+    try {
+      return await this.runTaskEffectGated(taskId, spec, task);
+    } finally {
+      await this.deps.store.releaseExecutionLease(taskId, owner.id);
+    }
+  }
+
+  private async runTaskEffectGated(taskId: string, spec: TaskEffectSpec, task: DurableTask): Promise<RunTaskEffectOutcome> {
     const key = taskEffectKey(taskId, spec.name);
     const existing = await this.deps.journal.getByKey(key);
 
@@ -836,7 +890,20 @@ export class TaskRuntime {
       if (fresh === undefined) return { outcome: "missing" };
       if (fresh.status === "COMPLETED") return { outcome: "completed", already: true };
       if (fresh.status === "CANCELLED") return { outcome: "cancelled" };
-      return await this.resumeGated(taskId, fresh, options);
+      const outcome = await this.resumeGated(taskId, fresh, options);
+      const terminal = await this.terminalOutcome(taskId);
+      // A continuation may itself complete the task; preserve its successful
+      // "resumed" result. Cancellation always wins over stale waiting results.
+      if (terminal?.outcome === "cancelled" || (outcome.outcome !== "resumed" && terminal !== undefined)) return terminal;
+      return outcome;
+    } catch (error) {
+      // A terminal transition may win a guarded park while an async gate was
+      // in flight. Report the durable terminal state, never a fictitious wait.
+      if (error instanceof TaskAwaitRejectedError) {
+        const terminal = await this.terminalOutcome(taskId);
+        if (terminal !== undefined) return terminal;
+      }
+      throw error;
     } finally {
       await this.deps.store.releaseRunLease(taskId, owner.id);
     }
@@ -852,6 +919,24 @@ export class TaskRuntime {
     // The recorded owner is dead; reclaim is guarded by the recorded pid so
     // two contenders recovering the same stale lease cannot both win.
     return this.deps.store.claimRunLease(taskId, owner, this.now(), claim.owner.ownerPid);
+  }
+
+  private async claimExecutionLease(
+    taskId: string,
+    expected: readonly TaskStatus[],
+    owner: { id: string; pid: number },
+  ): Promise<TaskExecutionLeaseClaim> {
+    const claim = await this.deps.store.claimExecutionLease(taskId, expected, owner, this.now());
+    if (claim.status !== "busy" || this.isProcessAlive(claim.owner.ownerPid)) return claim;
+    return this.deps.store.claimExecutionLease(taskId, expected, owner, this.now(), claim.owner.ownerId);
+  }
+
+  private async terminalOutcome(taskId: string): Promise<TaskResumeOutcome | undefined> {
+    const task = await this.deps.store.getTask(taskId);
+    if (task === undefined) return { outcome: "missing" };
+    if (task.status === "CANCELLED") return { outcome: "cancelled" };
+    if (task.status === "COMPLETED") return { outcome: "completed", already: true };
+    return undefined;
   }
 
   /** pid-existence probe; EPERM means the process exists but is not ours. */
@@ -947,6 +1032,8 @@ export class TaskRuntime {
         task,
         workspace: options.workspace,
       });
+      const terminal = await this.terminalOutcome(taskId);
+      if (terminal !== undefined) return terminal;
       const status = agent.status ?? (agent.resumed ? "completed" : "pending");
       if (status === "pending" || status === "failed") {
         // Reuse the existing adapter-owned wait — repeated pending/failed
@@ -972,14 +1059,15 @@ export class TaskRuntime {
     }
 
     const at = this.now();
-    if (task.status !== "ACTIVE") {
-      await this.deps.store.transitionTask(taskId, ["WAITING", "BLOCKED"], "ACTIVE", at, [
-        { type: "TASK_RESUMED", at },
-      ]);
-    } else {
-      await this.deps.store.updateTask(taskId, {}, at, [{ type: "TASK_RESUMED", at }]);
+    // This guarded commit admits the continuation; a terminal task cannot
+    // emit TASK_RESUMED or start a new continuation. Cancellation after
+    // admission still prevents subsequent task effects from being admitted.
+    const resumedTask = await this.deps.store.transitionTask(taskId, ["ACTIVE", "WAITING", "BLOCKED"], "ACTIVE", at, [
+      { type: "TASK_RESUMED", at },
+    ]);
+    if (resumedTask === undefined) {
+      return (await this.terminalOutcome(taskId)) ?? { outcome: "blocked", reason: "await-pending" };
     }
-    const resumedTask = (await this.deps.store.getTask(taskId)) ?? task;
 
     if (options.continuation !== undefined) {
       await options.continuation({ task: resumedTask, runtime: this, adapter, workspace: options.workspace });
@@ -1131,6 +1219,18 @@ export class TaskRuntime {
   // ---------------- terminal transitions ----------------
 
   async complete(taskId: string): Promise<boolean> {
+    const owner = { id: randomUUID(), pid: process.pid };
+    const claim = await this.claimExecutionLease(taskId, ["ACTIVE", "WAITING", "BLOCKED"], owner);
+    if (claim.status === "busy") throw new TaskExecutionBusyError(claim.owner);
+    if (claim.status === "inactive") return false;
+    try {
+      return await this.completeGated(taskId);
+    } finally {
+      await this.deps.store.releaseExecutionLease(taskId, owner.id);
+    }
+  }
+
+  private async completeGated(taskId: string): Promise<boolean> {
     const pending = await this.deps.store.pendingAwaits(taskId);
     if (pending.length > 0) {
       throw new Error(`cannot complete: ${String(pending.length)} await(s) still pending`);
@@ -1230,6 +1330,7 @@ export class MemoryTaskStore implements TaskStore {
     const task = this.tasks.get(id);
     if (task === undefined) return undefined;
     if (expected !== undefined && !expected.includes(task.status)) return undefined;
+    if (to === "COMPLETED" && [...this.awaitMap.values()].some((a) => a.taskId === id && a.status === "PENDING")) return undefined;
     const updated = { ...task, status: to, updatedAt: at };
     this.tasks.set(id, updated);
     this.pushEvents(id, events);
@@ -1328,6 +1429,29 @@ export class MemoryTaskStore implements TaskStore {
   }
 
   private readonly runLeases = new Map<string, TaskRunLease>();
+
+  private readonly executionLeases = new Map<string, TaskRunLease>();
+
+  async claimExecutionLease(
+    taskId: string,
+    expected: readonly TaskStatus[],
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerId?: string,
+  ): Promise<TaskExecutionLeaseClaim> {
+    const task = this.tasks.get(taskId);
+    if (task === undefined || !expected.includes(task.status)) {
+      return { status: "inactive", task: task === undefined ? undefined : { ...task } };
+    }
+    const held = this.executionLeases.get(taskId);
+    if (held !== undefined && held.ownerId !== expectedOwnerId) return { status: "busy", owner: { ...held } };
+    this.executionLeases.set(taskId, { taskId, ownerId: owner.id, ownerPid: owner.pid, acquiredAt: at });
+    return { status: "acquired" };
+  }
+
+  async releaseExecutionLease(taskId: string, ownerId: string): Promise<void> {
+    if (this.executionLeases.get(taskId)?.ownerId === ownerId) this.executionLeases.delete(taskId);
+  }
 
   async claimRunLease(
     taskId: string,

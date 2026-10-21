@@ -142,6 +142,33 @@ function runCliAsync(args: string[], env: Record<string, string>, cwd: string) {
   });
 }
 
+describe("relay task execution exit codes", () => {
+  for (const command of ["run", "resume"] as const) {
+    for (const [status, action, expected] of [
+      ["ACTIVE", "", 0],
+      ["WAITING", 'await runtime.createAwait(task.id, { kind: "USER", reason: "need input" });', 1],
+      ["BLOCKED", 'await runtime.blockTask(task.id, "synthetic block");', 2],
+      ["CANCELLED", "await runtime.cancel(task.id);", 2],
+      ["COMPLETED", "await runtime.complete(task.id);", 0],
+    ] as const) {
+      it(`${command} returns ${expected} for final ${status}`, () => {
+        const modPath = writeModule(`
+export async function run({ runtime, task }) { ${action} }
+export { run as continuation };
+`);
+        const created = command === "resume" ? runCli(["task", "create", "exit-code fixture"]) : undefined;
+        const createdId = created?.stdout.trim().split(/\s+/)[0];
+        const result = runCli(["task", command, createdId ?? "exit-code fixture", "--adapter-module", modPath]);
+        assert.equal(result.status, expected, result.stderr || result.stdout);
+        const id = createdId ?? /task ([0-9a-f-]{36})/.exec(result.stdout ?? "")?.[1] ?? "";
+        const snapshot = JSON.parse(runCli(["task", "show", id]).stdout ?? "{}") as { status: string; waitingFor: unknown[] };
+        assert.equal(snapshot.status, status);
+        assert.equal(snapshot.waitingFor.length, status === "WAITING" ? 1 : 0);
+      });
+    }
+  }
+});
+
 describe("relay task stage-1 hardening (cross-process)", () => {
   it("approving request A does not authorize a drifted request B; B re-approves then runs once", () => {
     const mark = join(tmp, "mark-drift");
@@ -180,7 +207,7 @@ export async function continuation({ runtime, task }) {
     const envB = { MARK_DIR: mark, EFFECT_REQUEST_JSON: '{"v":"b"}' };
 
     const run = runCliEnv(["task", "run", "ship", "--adapter-module", modPath], envA);
-    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.status, 1, run.stderr);
     assert.match(run.stdout ?? "", /decision awaiting-approval/);
     const id = /task ([0-9a-f-]{36})/.exec(run.stdout ?? "")?.[1] ?? "";
     assert.notEqual(id, "");
@@ -198,7 +225,7 @@ export async function continuation({ runtime, task }) {
 
     // Process restart + module config drift: request B must NOT execute.
     const drift = runCliEnv(["task", "resume", id, "--adapter-module", modPath], envB);
-    assert.equal(drift.status, 0);
+    assert.equal(drift.status, 1);
     assert.match(drift.stdout ?? "", /decision awaiting-approval/);
     assert.equal(markerCount(mark, "remote"), 0, "request B must not execute under A's approval");
 
@@ -437,7 +464,7 @@ export async function continuation({ runtime, task }) {
     };
     try {
       const run = await runCliAsync(["task", "run", "release fail-1", "--adapter-module", runtimePath], env, ws);
-      assert.equal(run.status, 0, run.err || run.out);
+      assert.equal(run.status, 1, run.err || run.out);
       assert.match(run.out, /publish decision: awaiting-approval/);
       const id = /task ([0-9a-f-]{36})/.exec(run.out)?.[1] ?? "";
 

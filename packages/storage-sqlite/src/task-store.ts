@@ -23,6 +23,7 @@ import type {
   TaskEvent,
   TaskEventInput,
   TaskEventType,
+  TaskExecutionLeaseClaim,
   TaskRunLease,
   TaskRunLeaseClaim,
   TaskStatus,
@@ -83,6 +84,13 @@ CREATE TABLE IF NOT EXISTS relay_task_artifacts (
 CREATE INDEX IF NOT EXISTS relay_task_artifacts_task ON relay_task_artifacts(task_id);
 -- Single-writer run lease: one row per task while a resume executes.
 CREATE TABLE IF NOT EXISTS relay_task_run_leases (
+  task_id     TEXT PRIMARY KEY REFERENCES relay_tasks(id),
+  owner_id    TEXT NOT NULL,
+  owner_pid   INTEGER NOT NULL,
+  acquired_at INTEGER NOT NULL
+);
+-- Separate from resume so a continuation can execute effects and complete.
+CREATE TABLE IF NOT EXISTS relay_task_execution_leases (
   task_id     TEXT PRIMARY KEY REFERENCES relay_tasks(id),
   owner_id    TEXT NOT NULL,
   owner_pid   INTEGER NOT NULL,
@@ -263,6 +271,9 @@ export class SqliteTaskStore implements TaskStore {
       const row = this.db.prepare("SELECT * FROM relay_tasks WHERE id = ?").get(id) as TaskRow | undefined;
       if (row === undefined) return;
       if (expected !== undefined && !expected.includes(row.status as TaskStatus)) return;
+      if (to === "COMPLETED" && this.db.prepare(
+        "SELECT 1 FROM relay_task_awaits WHERE task_id = ? AND status = 'PENDING' LIMIT 1",
+      ).get(id) !== undefined) return;
       this.db
         .prepare("UPDATE relay_tasks SET status = ?, updated_at = ? WHERE id = ?")
         .run(to, at, id);
@@ -466,6 +477,40 @@ export class SqliteTaskStore implements TaskStore {
       ref: row.ref ?? undefined,
       at: row.at,
     }));
+  }
+
+  async claimExecutionLease(
+    taskId: string,
+    expected: readonly TaskStatus[],
+    owner: { id: string; pid: number },
+    at: number,
+    expectedOwnerId?: string,
+  ): Promise<TaskExecutionLeaseClaim> {
+    let result: TaskExecutionLeaseClaim | undefined;
+    this.transaction(() => {
+      const task = this.db.prepare("SELECT * FROM relay_tasks WHERE id = ?").get(taskId) as TaskRow | undefined;
+      if (task === undefined || !expected.includes(task.status as TaskStatus)) {
+        result = { status: "inactive", task: task === undefined ? undefined : toTask(task) };
+        return;
+      }
+      const held = this.db.prepare("SELECT * FROM relay_task_execution_leases WHERE task_id = ?").get(taskId) as
+        { owner_id: string; owner_pid: number; acquired_at: number } | undefined;
+      if (held !== undefined && held.owner_id !== expectedOwnerId) {
+        result = { status: "busy", owner: {
+          taskId, ownerId: held.owner_id, ownerPid: held.owner_pid, acquiredAt: held.acquired_at,
+        } };
+        return;
+      }
+      this.db.prepare(`INSERT INTO relay_task_execution_leases (task_id, owner_id, owner_pid, acquired_at)
+        VALUES (?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET owner_id = excluded.owner_id,
+        owner_pid = excluded.owner_pid, acquired_at = excluded.acquired_at`).run(taskId, owner.id, owner.pid, at);
+      result = { status: "acquired" };
+    });
+    return result as TaskExecutionLeaseClaim;
+  }
+
+  async releaseExecutionLease(taskId: string, ownerId: string): Promise<void> {
+    this.db.prepare("DELETE FROM relay_task_execution_leases WHERE task_id = ? AND owner_id = ?").run(taskId, ownerId);
   }
 
   async claimRunLease(

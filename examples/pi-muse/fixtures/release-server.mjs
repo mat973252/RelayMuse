@@ -8,6 +8,7 @@
  *   - GET /state      — every counter the acceptance tests assert on.
  */
 import { createServer } from "node:http";
+import { performance } from "node:perf_hooks";
 
 export async function startReleaseServer(completeAfterMs = 600) {
   const jobs = new Map();
@@ -27,14 +28,14 @@ export async function startReleaseServer(completeAfterMs = 600) {
       nextJob += 1;
       submissions += 1;
       const jobId = `job-${nextJob}`;
-      jobs.set(jobId, { submittedAt: Date.now() });
+      jobs.set(jobId, { submittedAt: performance.now() });
       return send(200, { jobId });
     }
     const jobMatch = url.pathname.match(/^\/js\/(.+)$/);
     if (req.method === "GET" && jobMatch !== null) {
       const job = jobs.get(jobMatch[1]);
       if (job === undefined) return send(404, { error: "unknown job" });
-      if (Date.now() - job.submittedAt >= completeAfterMs) {
+      if (performance.now() - job.submittedAt >= completeAfterMs) {
         return send(200, { status: "complete", result: `agent checked release ${jobMatch[1]}: ok` });
       }
       return send(200, { status: "pending" });

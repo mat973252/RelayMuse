@@ -35,6 +35,42 @@ function taskFixture(id: string, goal = "release the package"): DurableTask {
   };
 }
 
+describe("SqliteTaskStore execution lease", () => {
+  it("persists across connections and only the exact owner can release or be reclaimed", async () => {
+    const path = dbPath();
+    const a = await SqliteTaskStore.open({ path });
+    await a.insertTask(taskFixture("execution"));
+    assert.equal((await a.claimExecutionLease("execution", ["ACTIVE"], { id: "a", pid: process.pid }, 1)).status, "acquired");
+    a.close();
+    const b = await SqliteTaskStore.open({ path });
+    try {
+      await b.releaseExecutionLease("execution", "wrong-owner");
+      assert.equal((await b.claimExecutionLease("execution", ["ACTIVE"], { id: "b", pid: process.pid }, 2)).status, "busy");
+      assert.equal((await b.claimExecutionLease("execution", ["ACTIVE"], { id: "b", pid: process.pid }, 3, "a")).status, "acquired");
+      // A stale contender cannot overwrite the successor, even with the same pid.
+      assert.equal((await b.claimExecutionLease("execution", ["ACTIVE"], { id: "c", pid: process.pid }, 4, "a")).status, "busy");
+      await b.releaseExecutionLease("execution", "a");
+      assert.equal((await b.claimExecutionLease("execution", ["ACTIVE"], { id: "c", pid: process.pid }, 5)).status, "busy");
+      await b.releaseExecutionLease("execution", "b");
+      assert.equal((await b.claimExecutionLease("execution", ["ACTIVE"], { id: "c", pid: process.pid }, 6)).status, "acquired");
+    } finally { b.close(); }
+  });
+
+  it("atomically rejects terminal/missing tasks without installing a lease", async () => {
+    const store = await SqliteTaskStore.open({ path: dbPath() });
+    try {
+      await store.insertTask(taskFixture("terminal"));
+      await store.transitionTask("terminal", ["ACTIVE"], "CANCELLED", 2);
+      const claim = await store.claimExecutionLease("terminal", ["ACTIVE"], { id: "a", pid: process.pid }, 3);
+      assert.equal(claim.status, "inactive");
+      if (claim.status === "inactive") assert.equal(claim.task?.status, "CANCELLED");
+      assert.deepEqual(await store.claimExecutionLease("missing", ["ACTIVE"], { id: "a", pid: process.pid }, 3), {
+        status: "inactive", task: undefined,
+      });
+    } finally { store.close(); }
+  });
+});
+
 describe("SqliteTaskStore", () => {
   it("AC-01: task identity survives close/reopen", async () => {
     const path = dbPath();

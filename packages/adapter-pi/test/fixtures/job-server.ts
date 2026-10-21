@@ -3,6 +3,7 @@
  * delay. POST /js (submissions counted once per job), GET /js/:id, GET /state.
  */
 import { createServer, type Server } from "node:http";
+import { performance } from "node:perf_hooks";
 
 export interface JobServer {
   baseUrl: string;
@@ -25,7 +26,7 @@ export async function startJobServer(completeAfterMs = 1_500): Promise<JobServer
       nextId += 1;
       submissions += 1;
       const jobId = `job-${nextId}`;
-      jobs.set(jobId, { submittedAt: Date.now() });
+      jobs.set(jobId, { submittedAt: performance.now() });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ jobId }));
       return;
@@ -39,7 +40,7 @@ export async function startJobServer(completeAfterMs = 1_500): Promise<JobServer
         res.end(JSON.stringify({ error: "unknown job" }));
         return;
       }
-      if (Date.now() - job.submittedAt >= completeAfterMs) {
+      if (performance.now() - job.submittedAt >= completeAfterMs) {
         completed = true;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ status: "complete", result: `job ${jobId} finished: 42` }));

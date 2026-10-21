@@ -131,6 +131,188 @@ function publishSpec(counters: { remote: number }, opts: { approvalRequired?: bo
   };
 }
 
+function barrier(): { entered: Promise<void>; held: Promise<void>; enter: () => void; release: () => void } {
+  let enter!: () => void;
+  let release!: () => void;
+  return {
+    entered: new Promise<void>((resolve) => { enter = resolve; }),
+    held: new Promise<void>((resolve) => { release = resolve; }),
+    enter: () => enter(),
+    release: () => release(),
+  };
+}
+
+describe("TaskRuntime terminal/execution concurrency", () => {
+  for (const terminal of ["complete", "cancel"] as const) {
+    it(`${terminal} wins against an effect holding a stale ACTIVE snapshot`, async () => {
+      const { runtime, store } = rig();
+      const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+      const gate = barrier();
+      const get = store.getTask.bind(store);
+      let first = true;
+      store.getTask = async (id) => {
+        const snapshot = await get(id);
+        if (first) {
+          first = false;
+          gate.enter();
+          await gate.held;
+        }
+        return snapshot;
+      };
+      const counters = { remote: 0 };
+      const effect = runtime.runTaskEffect(task.id, publishSpec(counters));
+      const rejected = assert.rejects(effect, { name: "TaskNotActiveError" });
+      await gate.entered;
+      try {
+        assert.equal(await runtime[terminal](task.id), true);
+      } finally {
+        gate.release();
+      }
+      await rejected;
+      assert.equal(counters.remote, 0);
+      assert.equal((await get(task.id))?.status, terminal === "complete" ? "COMPLETED" : "CANCELLED");
+    });
+  }
+
+  it("completion excludes a new effect throughout its unsettled-effects check", async () => {
+    const { runtime, journal } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const list = journal.list.bind(journal);
+    journal.list = async () => {
+      const snapshot = await list();
+      gate.enter();
+      await gate.held;
+      return snapshot;
+    };
+    const completing = runtime.complete(task.id);
+    await gate.entered;
+    const counters = { remote: 0 };
+    try {
+      await assert.rejects(runtime.runTaskEffect(task.id, publishSpec(counters)), { name: "TaskExecutionBusyError" });
+    } finally {
+      gate.release();
+    }
+    assert.equal(await completing, true);
+    assert.equal(counters.remote, 0);
+  });
+
+  it("completion cannot skip an await parked after its pending snapshot", async () => {
+    const { runtime, store } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const pending = store.pendingAwaits.bind(store);
+    store.pendingAwaits = async (...args) => {
+      const snapshot = await pending(...args);
+      gate.enter(); await gate.held;
+      return snapshot;
+    };
+    const completing = runtime.complete(task.id);
+    await gate.entered;
+    await runtime.createAwait(task.id, { kind: "USER", reason: "need input" });
+    gate.release();
+    assert.equal(await completing, false);
+    assert.equal((await store.getTask(task.id))?.status, "WAITING");
+  });
+
+  it("an admitted effect excludes completion and other effects, but can settle after cancellation", async () => {
+    const { runtime, store, journal } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const running = runtime.runTaskEffect(task.id, {
+      ...publishSpec({ remote: 0 }),
+      execute: async () => { gate.enter(); await gate.held; return { remoteRef: "pub-1" }; },
+    });
+    await gate.entered;
+    try {
+      await assert.rejects(runtime.complete(task.id), { name: "TaskExecutionBusyError" });
+      await assert.rejects(runtime.runTaskEffect(task.id, publishSpec({ remote: 0 })), { name: "TaskExecutionBusyError" });
+      assert.equal(await runtime.cancel(task.id), true);
+    } finally {
+      gate.release();
+    }
+    await running;
+    assert.equal((await store.getTask(task.id))?.status, "CANCELLED");
+    assert.equal((await journal.list())[0]?.status, "CONFIRMED");
+  });
+
+  for (const status of ["completed", "pending", "failed"] as const) {
+    it(`cancellation during a ${status} adapter result prevents continuation and parking`, async () => {
+      const { runtime, store } = rig();
+      const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+      const gate = barrier();
+      let continued = 0;
+      const resuming = runtime.resume(task.id, {
+        adapter: { id: "pi", resume: async () => {
+          gate.enter(); await gate.held; return { resumed: status === "completed", status };
+        } },
+        continuation: async () => { continued += 1; },
+      });
+      await gate.entered;
+      assert.equal(await runtime.cancel(task.id), true);
+      gate.release();
+      assert.equal((await resuming).outcome, "cancelled");
+      assert.equal(continued, 0);
+      assert.equal((await store.awaits(task.id)).length, 0);
+      assert.equal((await store.getTask(task.id))?.status, "CANCELLED");
+    });
+  }
+
+  it("a guarded continuation admission observes cancellation after the adapter check", async () => {
+    const { runtime, store } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const transition = store.transitionTask.bind(store);
+    store.transitionTask = async (id, expected, to, at, events) => {
+      if (events?.some((e) => e.type === "TASK_RESUMED")) {
+        gate.enter(); await gate.held;
+      }
+      return transition(id, expected, to, at, events);
+    };
+    let continued = 0;
+    const resuming = runtime.resume(task.id, { continuation: async () => { continued += 1; } });
+    await gate.entered;
+    assert.equal(await runtime.cancel(task.id), true);
+    gate.release();
+    assert.equal((await resuming).outcome, "cancelled");
+    assert.equal(continued, 0);
+    assert.equal((await store.taskEvents(task.id)).filter((e) => e.type === "TASK_RESUMED").length, 0);
+  });
+
+  it("cancel winning the adapter park commit returns cancelled, without a phantom await", async () => {
+    const { runtime, store } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const park = store.parkAwait.bind(store);
+    store.parkAwait = async (...args) => { gate.enter(); await gate.held; return park(...args); };
+    const resuming = runtime.resume(task.id, {
+      adapter: { id: "pi", resume: async () => ({ resumed: false, status: "pending" }) },
+    });
+    await gate.entered;
+    assert.equal(await runtime.cancel(task.id), true);
+    gate.release();
+    assert.equal((await resuming).outcome, "cancelled");
+    assert.equal((await store.awaits(task.id)).length, 0);
+  });
+
+  it("ambiguous in-flight work remains UNKNOWN after cancellation", async () => {
+    const { runtime, journal } = rig();
+    const task = await runtime.createTask({ goal: "ship", adapter: "pi" });
+    const gate = barrier();
+    const running = runtime.runTaskEffect(task.id, {
+      ...publishSpec({ remote: 0 }),
+      execute: async () => { gate.enter(); await gate.held; throw new AmbiguousEffectError("response lost"); },
+    });
+    await gate.entered;
+    assert.equal(await runtime.cancel(task.id), true);
+    gate.release();
+    const result = await running;
+    assert.equal(result.decision, "executed");
+    assert.equal((await journal.list())[0]?.status, "UNKNOWN");
+    assert.equal((await runtime.getTask(task.id))?.status, "CANCELLED");
+  });
+});
+
 describe("TaskRuntime lifecycle", () => {
   it("create -> await -> WAITING -> resolve -> resume -> ACTIVE", async () => {
     const { runtime, adapterCalls } = rig();
