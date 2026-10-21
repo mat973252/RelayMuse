@@ -56,7 +56,7 @@ try {
   summary.taskId = /task ([0-9a-f-]{36})/.exec(run.out)?.[1];
   check("task created", typeof summary.taskId === "string");
   const before = await show(summary.taskId, "waiting");
-  check("real model verified and task waiting for approval", run.status === 0 && before.status === "WAITING"
+  check("real model verified and task waiting for approval", run.status === 1 && before.status === "WAITING"
     && before.waitingFor.some((a) => a.kind === "APPROVAL"));
   const sessionBefore = readFileSync(before.agentRef.sessionFile);
   summary.sessionSha256 = createHash("sha256").update(sessionBefore).digest("hex");

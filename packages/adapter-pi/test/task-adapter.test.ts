@@ -215,6 +215,160 @@ describe("PiTaskAdapter", () => {
     assert.equal((await offlineAdapter().inspect(ref)).status, "idle");
   });
 
+  for (const [label, content] of [
+    ["no content blocks", []],
+    ["empty text", [{ type: "text", text: "" }]],
+    ["whitespace text", [{ type: "text", text: " \n\t\r " }]],
+    ["thinking only", [{ type: "thinking", thinking: "synthetic reasoning" }]],
+    ["empty text mixed with thinking", [{ type: "text", text: " " }, { type: "thinking", thinking: "synthetic reasoning" }]],
+  ] satisfies [string, AssistantMessage["content"]][]) {
+    it(`rejects deferred stop with ${label} and never authorizes continuation`, async () => {
+      const { manager, ref } = persistedSession();
+      const handle = { provider: "relay-mock-deferred", modelId: "relay-mock-job", api: "relay-mock-jobs", id: "empty-job" };
+      manager.appendMessage({ ...assistant("deferred"), deferred: handle });
+      const bytes = readFileSync(ref.sessionFile);
+      const mtime = statSync(ref.sessionFile).mtimeMs;
+      let polls = 0;
+      let submissions = 0;
+      const provider = createMockDeferredProvider({ baseUrl: "http://127.0.0.1:1" });
+      provider.stream = provider.streamSimple = () => { submissions += 1; throw new Error("unexpected new submission"); };
+      provider.fetchDeferred = (_model, actualHandle) => {
+        polls += 1;
+        assert.deepEqual(actualHandle, handle);
+        const events = createAssistantMessageEventStream();
+        events.push({ type: "done", reason: "stop", message: { ...assistant(), content } });
+        return events;
+      };
+      const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null });
+      modelRuntime.registerNativeProvider(provider);
+      const adapter = new PiTaskAdapter({ model: mockDeferredModel(), modelRuntime,
+        cwd: tmp, sessionDir: join(tmp, "persisted"), pollMs: 0, maxPolls: 3 });
+      const result = await adapter.resume(ref);
+      assert.equal(result.status, "failed");
+      assert.equal(result.resumed, false);
+      assert.equal(result.output, undefined);
+      assert.match(result.detail ?? "", /empty/);
+      assert.equal(polls, 1, "an empty final result is a failure, not another pending poll");
+
+      const store = new MemoryTaskStore();
+      const runtime = new TaskRuntime({ store, journal: new NopJournal() as never });
+      const task = await runtime.createTask({ goal: "synthetic task", adapter: "pi", agentRef: ref });
+      let continued = 0;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const outcome = await runtime.resume(task.id, { adapter,
+          continuation: async () => { continued += 1; await runtime.complete(task.id); } });
+        assert.equal(outcome.outcome, "blocked");
+        if (outcome.outcome === "blocked") assert.equal(outcome.reason, "adapter");
+      }
+      assert.equal(continued, 0);
+      assert.equal((await runtime.getTask(task.id))?.status, "WAITING");
+      assert.equal((await runtime.pendingAwaits(task.id)).length, 1, "failed re-polls reuse the adapter wait");
+      assert.equal(polls, 3);
+      assert.equal(submissions, 0, "never resubmit the agent job");
+      assert.deepEqual(readFileSync(ref.sessionFile), bytes);
+      assert.equal(statSync(ref.sessionFile).mtimeMs, mtime);
+    });
+  }
+
+  for (const reason of ["error", "aborted", "length", "toolUse", "setup-error"] as const) {
+    it(`fails deferred ${reason} immediately instead of exhausting pending polls`, async () => {
+      const { manager, ref } = persistedSession();
+      manager.appendMessage({ ...assistant("deferred"), deferred: {
+        provider: "relay-mock-deferred", modelId: "relay-mock-job", api: "relay-mock-jobs", id: "failed-job" } });
+      const bytes = readFileSync(ref.sessionFile);
+      const mtime = statSync(ref.sessionFile).mtimeMs;
+      let polls = 0;
+      let submissions = 0;
+      const provider = createMockDeferredProvider({ baseUrl: "http://127.0.0.1:1" });
+      provider.stream = provider.streamSimple = () => { submissions += 1; throw new Error("unexpected submission"); };
+      provider.fetchDeferred = () => {
+        polls += 1;
+        const events = createAssistantMessageEventStream();
+        if (reason === "error" || reason === "aborted") {
+          events.push({ type: "error", reason, error: assistant(reason) });
+        } else {
+          events.push({ type: "done", reason: "stop", message: assistant(reason === "setup-error" ? "stop" : reason) });
+        }
+        return events;
+      };
+      const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null });
+      modelRuntime.registerNativeProvider(reason === "setup-error" ? { ...provider,
+        auth: { apiKey: { name: "synthetic failure", resolve: async () => { throw new Error("SENSITIVE_ERROR_CANARY"); } } },
+      } : provider);
+      const adapter = new PiTaskAdapter({ model: mockDeferredModel(), modelRuntime,
+        cwd: tmp, sessionDir: join(tmp, "persisted"), pollMs: 0, maxPolls: 3 });
+      const result = await adapter.resume(ref);
+      assert.equal(result.status, "failed", JSON.stringify(result));
+      assert.equal(result.resumed, false);
+      assert.equal(result.output, undefined);
+      assert.equal(result.detail, `deferred assistant ended with ${reason === "setup-error" ? "error" : reason}`);
+      assert.ok(!JSON.stringify(result).includes("SENSITIVE_ERROR_CANARY"));
+      assert.equal(polls, reason === "setup-error" ? 0 : 1);
+      const runtime = new TaskRuntime({ store: new MemoryTaskStore(), journal: new NopJournal() as never });
+      const task = await runtime.createTask({ goal: "synthetic task", adapter: "pi", agentRef: ref });
+      let continued = 0;
+      const outcome = await runtime.resume(task.id, { adapter, continuation: async () => { continued += 1; } });
+      assert.equal(outcome.outcome, "blocked");
+      assert.equal(continued, 0);
+      assert.equal((await runtime.getTask(task.id))?.status, "WAITING");
+      assert.equal((await runtime.pendingAwaits(task.id)).length, 1);
+      assert.equal(submissions, 0);
+      assert.deepEqual(readFileSync(ref.sessionFile), bytes);
+      assert.equal(statSync(ref.sessionFile).mtimeMs, mtime);
+    });
+  }
+
+  it("keeps genuine deferred polls pending and can complete on a later explicit resume", async () => {
+    const { manager, ref } = persistedSession();
+    const handle = { provider: "relay-mock-deferred", modelId: "relay-mock-job", api: "relay-mock-jobs", id: "pending-job" };
+    manager.appendMessage({ ...assistant("deferred"), deferred: handle });
+    let polls = 0;
+    const provider = createMockDeferredProvider({ baseUrl: "http://127.0.0.1:1" });
+    provider.fetchDeferred = () => {
+      polls += 1;
+      const events = createAssistantMessageEventStream();
+      const message = polls <= 3 ? { ...assistant("deferred"), deferred: handle } : assistant();
+      events.push({ type: "done", reason: "stop", message });
+      return events;
+    };
+    const adapter = new PiTaskAdapter({ model: mockDeferredModel(), provider,
+      cwd: tmp, sessionDir: join(tmp, "persisted"), pollMs: 0, maxPolls: 3 });
+    assert.equal((await adapter.resume(ref)).status, "pending");
+    assert.equal(polls, 3);
+    assert.equal((await adapter.resume(ref)).status, "completed");
+    assert.equal(polls, 4);
+  });
+
+  it("accepts nonempty deferred text fragments without trimming the returned output", async () => {
+    const { manager, ref } = persistedSession();
+    manager.appendMessage({ ...assistant("deferred"), deferred: {
+      provider: "relay-mock-deferred", modelId: "relay-mock-job", api: "relay-mock-jobs", id: "valid-job" } });
+    const provider = createMockDeferredProvider({ baseUrl: "http://127.0.0.1:1" });
+    provider.fetchDeferred = () => {
+      const events = createAssistantMessageEventStream();
+      events.push({ type: "done", reason: "stop", message: { ...assistant(), content: [
+        { type: "text", text: " \n" }, { type: "thinking", thinking: "not final output" },
+        { type: "text", text: "有效结果" }, { type: "text", text: "\t " },
+      ] } });
+      return events;
+    };
+    const modelRuntime = await ModelRuntime.create({ refreshOnCreate: false, modelsPath: null });
+    modelRuntime.registerNativeProvider(provider);
+    const adapter = new PiTaskAdapter({ model: mockDeferredModel(), modelRuntime,
+      cwd: tmp, sessionDir: join(tmp, "persisted") });
+    assert.deepEqual(await adapter.resume(ref), {
+      resumed: true, status: "completed", detail: "deferred run completed", output: " \n有效结果\t ",
+    });
+    const runtime = new TaskRuntime({ store: new MemoryTaskStore(), journal: new NopJournal() as never });
+    const task = await runtime.createTask({ goal: "synthetic task", adapter: "pi", agentRef: ref });
+    let continued = 0;
+    const outcome = await runtime.resume(task.id, { adapter,
+      continuation: async () => { continued += 1; await runtime.complete(task.id); } });
+    assert.equal(outcome.outcome, "resumed");
+    assert.equal(continued, 1);
+    assert.equal((await runtime.getTask(task.id))?.status, "COMPLETED");
+  });
+
   it("attach persists agentRef; a fresh adapter resumes the deferred run", { timeout: 300_000 }, async () => {
     const server = await startJobServer(400);
     const sessionDir = join(tmp, "sessions");
@@ -260,13 +414,13 @@ describe("PiTaskAdapter", () => {
       assert.equal(inspected.status, "waiting-deferred");
 
       const result = await restarted.resume(ref);
-      assert.equal(result.resumed, true);
+      assert.equal(result.resumed, true, JSON.stringify(result));
       assert.equal((result as { status?: string }).status, "completed");
       assert.ok(String(result.output).length > 0);
 
       // Resume again after the job completed: no second job submission.
       const again = await restarted.resume(ref);
-      assert.equal(again.resumed, true);
+      assert.equal(again.resumed, true, JSON.stringify(again));
       assert.equal((again as { status?: string }).status, "completed");
 
       assert.equal(server.submissions(), 1, "exactly one job submission across attach+restart+resume");

@@ -92,7 +92,7 @@ async function orchestrate() {
     const taskId = /task ([0-9a-f-]{36})/.exec(run1.out)?.[1];
     check("run created a task", taskId !== undefined, run1.err);
     check("publish gated on approval (ASK, not executed)", run1.out.includes("publish decision: awaiting-approval"), run1.err);
-    check("task parked WAITING", run1.out.includes("status WAITING"), run1.err);
+    check("task parked WAITING (exit 1)", run1.status === 1 && run1.out.includes("status WAITING"), run1.err);
 
     log("RESTART — a fresh process must still know the task");
     const list = await relay(["task", "list"], { cwd: ws });

@@ -22,6 +22,7 @@ import {
   type TaskEffectSpec,
   type TaskResumeContext,
   type TaskStore,
+  type TaskStatus,
   type EffectJournal,
 } from "@relay/core";
 import { SqliteEffectJournal, SqliteEpistemicStore, SqliteTaskStore } from "@relay/storage-sqlite";
@@ -119,6 +120,10 @@ function printTask(task: { id: string; status: string; goal: string; updatedAt: 
   process.stdout.write(`${task.id}  ${task.status.padEnd(9)}  ${task.goal}${extra}\n`);
 }
 
+function taskStatusExitCode(status: TaskStatus): number {
+  return status === "WAITING" ? 1 : status === "BLOCKED" || status === "CANCELLED" ? 2 : 0;
+}
+
 export async function runTaskCommand(argv: string[], cwd: string): Promise<number> {
   const [sub, ...rest] = argv;
   if (sub === undefined) taskUsageError("task requires a subcommand: create|run|list|show|events|approve|resume|cancel");
@@ -186,7 +191,7 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
         const pending = await deps.runtime.pendingAwaits(task.id);
         const status = after?.status ?? "ACTIVE";
         process.stdout.write(`status ${status}${pending.length > 0 ? ` (waiting on ${pending.map((a) => a.kind).join(",")})` : ""}\n`);
-        return status === "BLOCKED" ? 2 : 0;
+        return taskStatusExitCode(status);
       }
       case "approve": {
         const id = args.positional[0] ?? taskUsageError("task approve requires <task-id>");
@@ -224,9 +229,12 @@ export async function runTaskCommand(argv: string[], cwd: string): Promise<numbe
           claimDelayMs: envNumber("RELAY_TEST_LEASE_CLAIM_DELAY_MS"),
         });
         switch (outcome.outcome) {
-          case "resumed":
+          case "resumed": {
             process.stdout.write(`resumed ${id}${outcome.agent?.detail !== undefined ? `  ${outcome.agent.detail}` : ""}\n`);
-            return 0;
+            // A successful continuation can park or block again; its durable
+            // final status determines the command result, not merely entry.
+            return taskStatusExitCode((await deps.runtime.getTask(id))?.status ?? "ACTIVE");
+          }
           case "completed":
             process.stdout.write(`completed ${id} (already)\n`);
             return 0;

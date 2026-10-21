@@ -180,7 +180,13 @@ export class PiTaskAdapter implements AgentAdapter {
       });
       if (result.stopReason === "stop") {
         const text = result.content?.map((part) => (part.type === "text" ? part.text : "")).join("") ?? "";
+        if (text.trim().length === 0) {
+          return { resumed: false, status: "failed", detail: "deferred assistant result is empty" };
+        }
         return { resumed: true, status: "completed", detail: "deferred run completed", output: text };
+      }
+      if (result.stopReason !== "deferred") {
+        return { resumed: false, status: "failed", detail: `deferred assistant ended with ${result.stopReason}` };
       }
       await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
